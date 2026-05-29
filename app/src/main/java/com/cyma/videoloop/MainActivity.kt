@@ -1,13 +1,18 @@
 package com.cyma.videoloop
 
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.CircularProgressIndicator
@@ -46,8 +51,17 @@ class MainActivity : ComponentActivity() {
     @Inject lateinit var identity: DeviceIdentityRepository
     @Inject lateinit var scheduleRepository: ScheduleRepository
 
+    private val overlayPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { /* result ignored — canDrawOverlays is re-checked on next launch */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // "Draw over other apps" grants a permanent background-activity-start
+        // exemption, which the boot receiver needs to launch this screen after a
+        // reboot on ROMs that block background starts (e.g. Amlogic TX3 mini+).
+        // Prompt once on launch if it isn't granted yet.
+        ensureOverlayPermission()
         // Sane default before the schedule flow emits — avoids a brief portrait
         // flash on cold start when the device is held vertically.
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
@@ -126,6 +140,16 @@ class MainActivity : ComponentActivity() {
      *  - 4xx                            → not paired → pairing
      *  - network unreachable            → fall back to last-known cached state
      */
+    private fun ensureOverlayPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        if (Settings.canDrawOverlays(this)) return
+        val intent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:$packageName")
+        )
+        runCatching { overlayPermissionLauncher.launch(intent) }
+    }
+
     private suspend fun resolveStartDestination(): String {
         val serverSays = scheduleRepository.isPaired()
         when (serverSays) {
