@@ -1,5 +1,6 @@
 package com.cyma.videoloop
 
+import android.app.AppOpsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -8,6 +9,7 @@ import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Process
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -53,14 +55,14 @@ class MainActivity : ComponentActivity() {
 
     private val overlayPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
-    ) { /* result ignored — canDrawOverlays is re-checked on next launch */ }
+    ) { /* result ignored — the appop is re-checked on next launch */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // "Draw over other apps" grants a permanent background-activity-start
-        // exemption, which the boot receiver needs to launch this screen after a
-        // reboot on ROMs that block background starts (e.g. Amlogic TX3 mini+).
-        // Prompt once on launch if it isn't granted yet.
+        // "Draw over other apps" sets the SYSTEM_ALERT_WINDOW appop to
+        // MODE_ALLOWED, which is what grants the background-activity-start
+        // exemption the boot receiver needs to relaunch after a reboot. Prompt for
+        // it on launch until it's explicitly allowed.
         ensureOverlayPermission()
         // Sane default before the schedule flow emits — avoids a brief portrait
         // flash on cold start when the device is held vertically.
@@ -142,12 +144,36 @@ class MainActivity : ComponentActivity() {
      */
     private fun ensureOverlayPermission() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
-        if (Settings.canDrawOverlays(this)) return
+        if (isOverlayOpAllowed()) return
         val intent = Intent(
             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
             Uri.parse("package:$packageName")
         )
         runCatching { overlayPermissionLauncher.launch(intent) }
+    }
+
+    /**
+     * True only when the SYSTEM_ALERT_WINDOW appop is *explicitly* MODE_ALLOWED —
+     * the state the ROM's background-activity-start exemption actually requires.
+     *
+     * We must read the RAW op mode: Settings.canDrawOverlays() and the regular
+     * checkOp/noteOp variants resolve an unset op (MODE_DEFAULT) to "allowed" when
+     * the manifest declares the permission, so they report the permission as
+     * granted even though the user never enabled it and the BAL exemption is not
+     * active. unsafeCheckOpRawNoThrow returns the stored mode without that
+     * resolution, so MODE_DEFAULT stays distinguishable from MODE_ALLOWED.
+     */
+    private fun isOverlayOpAllowed(): Boolean {
+        val aom = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            aom.unsafeCheckOpRawNoThrow(
+                AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW, Process.myUid(), packageName
+            )
+        } else {
+            // No raw-mode API before API 29; fall back to the resolved check.
+            return Settings.canDrawOverlays(this)
+        }
+        return mode == AppOpsManager.MODE_ALLOWED
     }
 
     private suspend fun resolveStartDestination(): String {
