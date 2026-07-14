@@ -42,6 +42,9 @@ import com.cyma.videoloop.data.schedule.ScheduleRepository
 import com.cyma.videoloop.domain.model.Orientation
 import com.cyma.videoloop.ui.pairing.PairingScreen
 import com.cyma.videoloop.ui.playback.PlaybackScreen
+import com.cyma.videoloop.ui.provisioning.WifiSetupOverlay
+import com.cyma.videoloop.wifi.ProvisioningState
+import com.cyma.videoloop.wifi.WifiProvisioningCoordinator
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -52,6 +55,7 @@ class MainActivity : ComponentActivity() {
 
     @Inject lateinit var identity: DeviceIdentityRepository
     @Inject lateinit var scheduleRepository: ScheduleRepository
+    @Inject lateinit var provisioningCoordinator: WifiProvisioningCoordinator
 
     private val overlayPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -64,6 +68,10 @@ class MainActivity : ComponentActivity() {
         // exemption the boot receiver needs to relaunch after a reboot. Prompt for
         // it on launch until it's explicitly allowed.
         ensureOverlayPermission()
+        // Watch connectivity in the background and run WiFi setup (hotspot +
+        // captive portal) without ever interrupting playback. App-scoped, so it
+        // survives activity recreation.
+        provisioningCoordinator.ensureRunning()
         // Sane default before the schedule flow emits — avoids a brief portrait
         // flash on cold start when the device is held vertically.
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
@@ -96,6 +104,7 @@ class MainActivity : ComponentActivity() {
                     Surface(modifier = Modifier.fillMaxSize()) {
                         val navController = rememberNavController()
                         var startDestination by remember { mutableStateOf<String?>(null) }
+                        val provisioningState by provisioningCoordinator.state.collectAsState()
                         LaunchedEffect(Unit) {
                             startDestination = resolveStartDestination()
                         }
@@ -113,18 +122,26 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
-                        when (startDestination) {
-                            null -> SplashScreen()
-                            else -> NavHost(navController = navController, startDestination = startDestination!!) {
-                                composable("pairing") {
-                                    PairingScreen(onPaired = {
-                                        navController.navigate("playback") {
-                                            popUpTo("pairing") { inclusive = true }
-                                        }
-                                    })
+                        // Content is the always-on base layer; WiFi setup renders
+                        // as a corner overlay on top of it and never replaces it.
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            when (startDestination) {
+                                null -> SplashScreen()
+                                else -> NavHost(navController = navController, startDestination = startDestination!!) {
+                                    composable("pairing") {
+                                        PairingScreen(onPaired = {
+                                            navController.navigate("playback") {
+                                                popUpTo("pairing") { inclusive = true }
+                                            }
+                                        })
+                                    }
+                                    composable("playback") { PlaybackScreen() }
                                 }
-                                composable("playback") { PlaybackScreen() }
                             }
+                            WifiSetupOverlay(
+                                state = provisioningState,
+                                onPermissionsGranted = { provisioningCoordinator.onPermissionsGranted() },
+                            )
                         }
                     }
                 }
@@ -177,6 +194,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private suspend fun resolveStartDestination(): String {
+        // Connectivity no longer gates the start destination — WiFi setup runs as a
+        // background overlay (see WifiProvisioningCoordinator), so content always
+        // shows. Offline just means the cached schedule keeps playing.
         val serverSays = scheduleRepository.isPaired()
         when (serverSays) {
             true -> identity.setPaired(true)

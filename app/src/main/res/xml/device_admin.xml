@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Minimal device-admin policy set. Device-owner privilege (granted out of band
+     via `dpm set-device-owner`) is what actually unlocks the WiFi + permission
+     APIs used by the provisioning flow; no extra admin policies are required. -->
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+        <force-lock />
+    </uses-policies>
+</device-admin>

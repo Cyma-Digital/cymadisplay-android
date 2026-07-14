@@ -96,6 +96,10 @@ dependencies {
     implementation(libs.retrofit.kotlinx.serialization)
     implementation(libs.kotlinx.serialization.json)
 
+    // WiFi provisioning
+    implementation(libs.zxing.core)        // QR code generation for the setup hotspot
+    implementation(libs.nanohttpd)         // captive-portal HTTP server on the local-only hotspot
+
     // Storage
     implementation(libs.datastore.preferences)
 

@@ -5,6 +5,26 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- WiFi provisioning: detect connectivity, scan/join networks, run the
+         setup hotspot. ACCESS_FINE_LOCATION and NEARBY_WIFI_DEVICES back the
+         scan + LocalOnlyHotspot APIs; the app self-grants them at runtime via
+         its device-owner privilege (see admin.DeviceOwnerManager). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- WRITE_SETTINGS lets the legacy tethering-hotspot path (API < 26) author
+         the AP config via WifiManager.setWifiApEnabled. On API 23+ it is gated at
+         runtime by an appop; the warehouse provisioning step runs
+         `adb shell appops set com.cyma.videoloop WRITE_SETTINGS allow` to enable it.
+         Auto-granted on install below API 23. -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:minSdkVersion="33" />
     <!-- Enabling "Draw over other apps" sets the SYSTEM_ALERT_WINDOW appop to
          MODE_ALLOWED, which grants the background-activity-start exemption the
          boot receiver needs to relaunch the app after a reboot on ROMs that
@@ -44,6 +64,26 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Device-admin receiver. Provisioned once per box at the warehouse via
+             `adb shell dpm set-device-owner com.cyma.videoloop/.admin.CymaAdminReceiver`
+             followed by `adb shell appops set com.cyma.videoloop WRITE_SETTINGS allow`
+             (the latter backs the legacy tethering-hotspot path on API < 26).
+             Device-owner status is what lets the app silently self-grant the
+             location permission and program the WiFi config during setup. -->
+        <receiver
+            android:name=".admin.CymaAdminReceiver"
+            android:description="@string/device_admin_description"
+            android:label="@string/device_admin_label"
+            android:permission="android.permission.BIND_DEVICE_ADMIN"
+            android:exported="true">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
             </intent-filter>
         </receiver>
 

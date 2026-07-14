@@ -38,7 +38,18 @@ All dependency versions are in `gradle/libs.versions.toml`.
 ```
 com.cyma.videoloop/
 ├── App.kt                        HiltAndroidApp; enqueues ScheduleSyncWorker on boot
-├── MainActivity.kt               @AndroidEntryPoint thin shell; hosts NavHost
+├── MainActivity.kt               @AndroidEntryPoint thin shell; hosts NavHost + WiFi-setup overlay on top
+├── admin/
+│   ├── CymaAdminReceiver.kt      DeviceAdminReceiver; provisioned via `dpm set-device-owner`
+│   └── DeviceOwnerManager.kt     device-owner checks + silent runtime-permission self-grant
+├── wifi/
+│   ├── WifiProvisioningCoordinator.kt  app-scoped state machine; watches connectivity, runs setup in background
+│   ├── ConnectivityMonitor.kt    validated-internet snapshot + flow + awaitValidatedInternet(timeout)
+│   ├── WifiScanner.kt            startScan → List<ScannedNetwork> (run BEFORE the hotspot)
+│   ├── SoftApController.kt       LocalOnlyHotspot wrapper → SoftApResult (creds or a failure reason)
+│   ├── CaptivePortalServer.kt    NanoHTTPD form on the hotspot; SSID dropdown + password + rescan; intercepts OS probes
+│   ├── WifiJoiner.kt             DO addNetwork/enableNetwork/reconnect (+ suggestion fallback) → await internet
+│   └── HotspotAddress.kt         resolves the hotspot gateway IP for the on-screen fallback URL
 ├── di/
 │   ├── NetworkModule.kt          OkHttp + Retrofit + CymaApi; reads API_BASE_URL from BuildConfig
 │   └── StorageModule.kt          DataStore<Preferences> singleton
@@ -56,8 +67,12 @@ com.cyma.videoloop/
 │   ├── PlaylistItem.kt           sealed interface Video | Image; @Serializable with @SerialName
 │   ├── Schedule.kt               Schedule + ActiveWindow; @Serializable
 │   └── DeviceState.kt            Unpaired | Paired
-├── util/HashUtils.kt             sha256()
+├── util/
+│   ├── HashUtils.kt              sha256()
+│   └── QrCode.kt                 ZXing QR bitmap + WIFI: payload builder
 ├── ui/
+│   ├── provisioning/
+│   │   └── WifiSetupOverlay.kt   corner QR/status overlay driven by WifiProvisioningCoordinator.state
 │   ├── playback/
 │   │   ├── PlaybackViewModel.kt  @HiltViewModel; collects schedule → materializes each item → emits PlaybackUiState
 │   │   ├── PlaybackScreen.kt     observes ViewModel; shows DownloadDialog or PlaybackEngine or ErrorScreen
@@ -97,3 +112,44 @@ com.cyma.videoloop/
 ### API base URL
 
 Defined per build type in `app/build.gradle.kts` as `buildConfigField("String", "API_BASE_URL", ...)`. Change both `debug` and `release` when pointing at a new backend.
+
+## WiFi provisioning
+
+Provisioning runs **in the background and never interrupts playback**.
+`WifiProvisioningCoordinator` (app-scoped `@Singleton`, its own scope) watches
+`ConnectivityMonitor.validatedInternetFlow()`: internet lost → raise a
+`LocalOnlyHotspot` + captive portal and publish `ProvisioningState`; internet
+gained → tear everything down (`Idle`). `MainActivity` calls
+`coordinator.ensureRunning()` and renders `WifiSetupOverlay` — a corner card with
+a `WIFI:` QR — on top of the always-running content (`PlaybackScreen`/pairing).
+The installer's phone scans the QR to auto-join, then a captive-portal form
+(`CaptivePortalServer`, NanoHTTPD: SSID dropdown + password + rescan) posts back.
+On submit the box tears the hotspot down (single-radio boxes can't host an AP and
+be a client at once) and joins via `WifiJoiner`; once internet validates, the
+connectivity watcher idles the overlay automatically. A failed join re-arms the
+hotspot; a failed hotspot start (e.g. Location services off) surfaces the reason
+and retries after 20 s.
+
+**The join depends on device-owner status.** A non-privileged app on Android 10+
+cannot silently join an arbitrary WiFi network; a device owner can. Provision each
+box once at the warehouse (no accounts on the device):
+
+```bash
+adb shell dpm set-device-owner com.cyma.videoloop/.admin.CymaAdminReceiver
+# verify:
+adb shell dumpsys device_policy | grep -i "Device Owner"
+```
+
+Device-owner status also lets `DeviceOwnerManager` self-grant `ACCESS_FINE_LOCATION`
+(needed by the scan + hotspot APIs) with no on-device prompt — essential on a
+remote-only box. Without device owner the flow degrades: it falls back to a runtime
+permission request and the advisory `WifiNetworkSuggestion` API (may not connect).
+
+Key invariants:
+- **Scan before hotspot** — a single-radio box can't scan for client networks while
+  its AP is up, so `WifiScanner.scan()` runs before `SoftApController.start()` and the
+  result is cached for the portal dropdown.
+- **Success = validated internet** — `WifiJoiner` only reports success once the box
+  actually reaches the internet, so a wrong password or captive AP re-arms the hotspot.
+- The captive portal serves **cleartext to the phone** (inbound); `cleartextTrafficPermitted="false"`
+  governs only the box app's own outbound traffic, so no `network_security_config` change is needed.
