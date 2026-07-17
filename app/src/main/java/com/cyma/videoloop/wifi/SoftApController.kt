@@ -6,9 +6,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.location.LocationManager
+import android.net.ConnectivityManager
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.ResultReceiver
 import android.provider.Settings
 import android.util.Log
 import androidx.annotation.RequiresApi
@@ -57,8 +62,15 @@ class SoftApController @Inject constructor(
     @Volatile
     private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
 
-    // Both paths supported: API 26+ via startLocalOnlyHotspot, API < 26 via the
-    // legacy setWifiApEnabled tethering path.
+    /** Which bring-up mechanism is currently active, so [stop] tears down the right one. */
+    private enum class Mechanism { NONE, LOHS, TETHER, LEGACY }
+
+    @Volatile
+    private var active: Mechanism = Mechanism.NONE
+
+    // Three paths supported: API 26+ tries the fixed-credential tethering reflection
+    // path first, then falls back to startLocalOnlyHotspot; API < 26 uses the legacy
+    // setWifiApEnabled tethering path.
     val isSupported: Boolean get() = true
 
     /**
@@ -78,14 +90,19 @@ class SoftApController @Inject constructor(
     }
 
     /**
-     * Starts the hotspot. API 26+: [startLocalOnlyHotspot] with OS-chosen creds.
-     * API < 26: the legacy [WifiManager.setWifiApEnabled] tethering path with our
-     * own fixed credentials (see [startLegacyTetherHotspot]). Only the API 26+
-     * path consults location services — `setWifiApEnabled` on pre-O doesn't.
+     * Starts the hotspot. API 26+: first tries [startTetheredHotspot] — a reflection
+     * path that gets us our own fixed SSID/passphrase — and only falls back to
+     * OS-controlled [startLocalOnlyHotspot] when that tier is unavailable (wrong
+     * appop, blocked reflection, unreadable credentials). API < 26: the legacy
+     * [WifiManager.setWifiApEnabled] tethering path with our own fixed credentials
+     * (see [startLegacyTetherHotspot]). Location services only gate the LOHS
+     * fallback — tethering isn't location-gated, and `setWifiApEnabled` on pre-O
+     * doesn't consult it either.
      */
     @Suppress("DEPRECATION")
     suspend fun start(): SoftApResult {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startTetheredHotspot()?.let { return it }
             if (!isLocationServicesEnabled()) {
                 return SoftApResult.Failed("Turn on Location (device Settings → Location) so the setup hotspot can start.")
             }
@@ -96,14 +113,16 @@ class SoftApController @Inject constructor(
 
     @Suppress("DEPRECATION")
     fun stop() {
-        reservation?.let { res -> // API 26+ path
-            reservation = null
-            runCatching { res.close() }
+        when (active) {
+            Mechanism.LOHS -> {
+                reservation?.let { res -> runCatching { res.close() } }
+                reservation = null
+            }
+            Mechanism.TETHER -> TetherReflection.stopTethering(context)
+            Mechanism.LEGACY -> ApReflection.setWifiApEnabled(wifiManager, null, false)
+            Mechanism.NONE -> Unit
         }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            // Legacy tether teardown. reservation is always null on this path.
-            ApReflection.setWifiApEnabled(wifiManager, null, false)
-        }
+        active = Mechanism.NONE
     }
 
     // Location permission is self-granted upstream via device-owner privilege
@@ -116,6 +135,7 @@ class SoftApController @Inject constructor(
             val callback = object : WifiManager.LocalOnlyHotspotCallback() {
                 override fun onStarted(res: WifiManager.LocalOnlyHotspotReservation) {
                     reservation = res
+                    active = Mechanism.LOHS
                     val creds = res.readCredentials()
                     if (cont.isActive) {
                         cont.resume(
@@ -169,6 +189,77 @@ class SoftApController @Inject constructor(
         val cfg = wifiConfiguration ?: return null
         val ssid = cfg.SSID ?: return null
         return SoftApCredentials(ssid = ssid.stripQuotes(), passphrase = cfg.preSharedKey?.stripQuotes())
+    }
+
+    // ------------------------------------------------------------------
+    // Tethering hotspot with fixed credentials (API 26+, best-effort)
+    // ------------------------------------------------------------------
+    // startLocalOnlyHotspot hands SSID/passphrase/gateway control to the OS, which is
+    // why LOHS boxes show a random SSID (e.g. "AndroidShare_6325") that changes every
+    // start. This tier tries the same setWifiApConfiguration + tethering-service
+    // reflection the box's own Settings hotspot UI is built on, to get our fixed
+    // "CymaDisplay-<suffix>" / "cyma102030" creds instead. It requires the
+    // WRITE_SETTINGS appop (already granted at warehouse provisioning time) and is
+    // gated per-OEM/per-API — Android Q's stricter NETWORK_SETTINGS check often blocks
+    // the config write/read outright. Any failure returns null (never Failed) so
+    // [start] falls through to [startLocalOnlyHotspot] as the universal safety net.
+
+    /**
+     * Attempts to raise the hotspot via the hidden tethering-service reflection path
+     * with our own fixed SSID/passphrase. Returns null (not [SoftApResult.Failed])
+     * when the tier is unavailable for any reason, so the caller falls back to
+     * [startLocalOnlyHotspot].
+     */
+    @SuppressLint("MissingPermission")
+    @RequiresApi(Build.VERSION_CODES.O)
+    @Suppress("DEPRECATION")
+    private suspend fun startTetheredHotspot(): SoftApResult? {
+        if (!Settings.System.canWrite(context)) {
+            Log.i(
+                TAG,
+                "tether tier unavailable (WRITE_SETTINGS appop not granted) → LOHS. " +
+                    "Run: adb shell appops set ${context.packageName} WRITE_SETTINGS allow",
+            )
+            return null
+        }
+
+        val suffix = setupSuffix()
+        val ssid = "$HOTSPOT_SSID_PREFIX-$suffix"
+        val config = WifiConfiguration().apply {
+            SSID = ssid
+            preSharedKey = HOTSPOT_PASSPHRASE
+            // Hidden KeyMgmt.WPA2_PSK (bit 4, not in the public SDK). O–Q's
+            // validateApWifiConfiguration rejects a WPA_PSK-only config for the AP path.
+            allowedKeyManagement.set(4)
+        }
+
+        if (!ApReflection.setWifiApConfiguration(wifiManager, config)) {
+            Log.i(TAG, "tether tier unavailable (setWifiApConfiguration rejected) → LOHS")
+            return null
+        }
+        val readBack = readApConfig()
+        if (readBack == null) {
+            Log.i(TAG, "tether tier unavailable (config read-back failed) → LOHS")
+            return null
+        }
+
+        if (!TetherReflection.startTethering(context)) {
+            Log.i(TAG, "tether tier unavailable (startTethering reflection failed) → LOHS")
+            return null
+        }
+
+        return when (awaitApState(AP_UP_TIMEOUT_MS)) {
+            ApState.Enabled -> {
+                Log.i(TAG, "hotspot tier: TETHER — up as ${readBack.ssid}")
+                active = Mechanism.TETHER
+                SoftApResult.Started(readBack)
+            }
+            else -> {
+                Log.i(TAG, "tether tier unavailable (AP didn't come up) → LOHS")
+                runCatching { TetherReflection.stopTethering(context) }
+                null
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -270,6 +361,7 @@ class SoftApController @Inject constructor(
         when (awaitApState(AP_UP_TIMEOUT_MS)) {
             ApState.Enabled -> {
                 Log.i(TAG, "legacy hotspot up: $ssid")
+                active = Mechanism.LEGACY
                 SoftApResult.Started(SoftApCredentials(ssid = ssid, passphrase = passphrase))
             }
             ApState.Failed -> SoftApResult.Failed("The setup hotspot failed to come up on this ROM.")
@@ -395,4 +487,68 @@ private object ApReflection {
 
     fun getWifiApState(wm: WifiManager): Int =
         runCatching { getApState?.invoke(wm) as? Int ?: -1 }.getOrDefault(-1)
+}
+
+/**
+ * Reflective shim around the hidden `IConnectivityManager.startTethering` binder
+ * call (the tethering-service entry point behind the Settings hotspot UI) and the
+ * public-but-`@SystemApi` `ConnectivityManager.stopTethering(int)`. Both are `@hide`
+ * from the compileSdk 34 stub. Permission model: `TETHER_PRIVILEGED` OR the
+ * `WRITE_SETTINGS` appop (already required by [SoftApController.startTetheredHotspot]
+ * before this is ever called). On R+ the connectivity service moved into the
+ * Tethering mainline module and these lookups throw — every call here is wrapped
+ * in `runCatching` so that just means this tier silently yields to LOHS.
+ */
+private object TetherReflection {
+    private const val TETHERING_WIFI = 0
+
+    private val stopTetheringMethod: Method? = runCatching {
+        ConnectivityManager::class.java.getMethod("stopTethering", Int::class.javaPrimitiveType)
+    }.getOrNull()
+
+    private val icmStubClass: Class<*>? = runCatching { Class.forName("android.net.IConnectivityManager\$Stub") }.getOrNull()
+    private val icmClass: Class<*>? = runCatching { Class.forName("android.net.IConnectivityManager") }.getOrNull()
+    private val serviceManagerClass: Class<*>? = runCatching { Class.forName("android.os.ServiceManager") }.getOrNull()
+
+    private fun connectivityBinderProxy(): Any? = runCatching {
+        val getService = serviceManagerClass?.getMethod("getService", String::class.java) ?: return null
+        val binder = getService.invoke(null, Context.CONNECTIVITY_SERVICE) as? IBinder ?: return null
+        val asInterface = icmStubClass?.getMethod("asInterface", IBinder::class.java) ?: return null
+        asInterface.invoke(null, binder)
+    }.getOrNull()
+
+    /** Starts WiFi tethering with default framework provisioning. False on any failure. */
+    fun startTethering(context: Context): Boolean = runCatching {
+        val proxy = connectivityBinderProxy() ?: return false
+        val cls = icmClass ?: return false
+        val receiver = object : ResultReceiver(Handler(Looper.getMainLooper())) {}
+
+        val fourArg = runCatching {
+            cls.getMethod(
+                "startTethering",
+                Int::class.javaPrimitiveType, ResultReceiver::class.java,
+                Boolean::class.javaPrimitiveType, String::class.java,
+            )
+        }.getOrNull()
+        if (fourArg != null) {
+            fourArg.invoke(proxy, TETHERING_WIFI, receiver, false, context.packageName)
+            return true
+        }
+
+        // N/O signature omits the caller package.
+        val threeArg = cls.getMethod(
+            "startTethering",
+            Int::class.javaPrimitiveType, ResultReceiver::class.java, Boolean::class.javaPrimitiveType,
+        )
+        threeArg.invoke(proxy, TETHERING_WIFI, receiver, false)
+        true
+    }.getOrDefault(false)
+
+    /** Best-effort teardown. Safe to call even if [startTethering] never ran or failed. */
+    fun stopTethering(context: Context) {
+        runCatching {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            stopTetheringMethod?.invoke(cm, TETHERING_WIFI)
+        }
+    }
 }

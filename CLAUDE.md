@@ -117,18 +117,50 @@ Defined per build type in `app/build.gradle.kts` as `buildConfigField("String", 
 
 Provisioning runs **in the background and never interrupts playback**.
 `WifiProvisioningCoordinator` (app-scoped `@Singleton`, its own scope) watches
-`ConnectivityMonitor.validatedInternetFlow()`: internet lost → raise a
-`LocalOnlyHotspot` + captive portal and publish `ProvisioningState`; internet
-gained → tear everything down (`Idle`). `MainActivity` calls
-`coordinator.ensureRunning()` and renders `WifiSetupOverlay` — a corner card with
-a `WIFI:` QR — on top of the always-running content (`PlaybackScreen`/pairing).
-The installer's phone scans the QR to auto-join, then a captive-portal form
-(`CaptivePortalServer`, NanoHTTPD: SSID dropdown + password + rescan) posts back.
-On submit the box tears the hotspot down (single-radio boxes can't host an AP and
-be a client at once) and joins via `WifiJoiner`; once internet validates, the
-connectivity watcher idles the overlay automatically. A failed join re-arms the
-hotspot; a failed hotspot start (e.g. Location services off) surfaces the reason
-and retries after 20 s.
+`ConnectivityMonitor.validatedInternetFlow()`: internet lost → raise a hotspot +
+captive portal and publish `ProvisioningState`; internet gained → tear everything
+down (`Idle`). `MainActivity` calls `coordinator.ensureRunning()` and renders
+`WifiSetupOverlay` — a corner card — on top of the always-running content
+(`PlaybackScreen`/pairing). The card is **two steps, no WiFi-join QR**: step 1 is a
+prominent SSID/password banner the installer reads and joins manually on the phone
+(there's nothing to scan for this step — the hotspot must be joined before the
+portal is reachable at all); step 2 is a single QR encoding the portal URL (or the
+URL as text) that opens the captive-portal form (`CaptivePortalServer`, NanoHTTPD:
+SSID dropdown + password + rescan). On submit the box tears the hotspot down
+(single-radio boxes can't host an AP and be a client at once) and joins via
+`WifiJoiner`; once internet validates, the connectivity watcher idles the overlay
+automatically. A failed join re-arms the hotspot (and pushes the session deadline
+forward, so a few wrong-password retries don't trip the terminal stop below); a
+failed hotspot start (e.g. Location services off) surfaces the reason and retries
+after 20 s.
+
+**Hotspot bring-up is three-tiered** (`SoftApController.start()`), because only
+some mechanisms let the app pick its own SSID/passphrase/gateway:
+1. **Tether tier (API 26+, tried first)** — reflection on
+   `WifiManager.setWifiApConfiguration` + the hidden `IConnectivityManager.startTethering`
+   binder call, the same path the box's own Settings hotspot UI uses. Gets our fixed
+   `CymaDisplay-<suffix>` / `cyma102030` credentials and a gateway that's typically
+   stable per device (often `192.168.43.1`). Gated behind the `WRITE_SETTINGS` appop
+   and per-OEM/per-API reflection support (Android Q's stricter config-write gating
+   often blocks it outright) — any failure returns `null` and falls through to tier 2,
+   it never surfaces a broken/guessed-credentials hotspot.
+2. **`LocalOnlyHotspot` (API 26+ fallback)** — the OS chooses SSID, passphrase, and
+   gateway subnet, and they can change on every start. This is why some boxes show a
+   random SSID like `AndroidShare_6325` instead of `CymaDisplay-*` — expected on ROMs
+   where tier 1 doesn't apply (e.g. confirmed on API 29 Amlogic TX3 boxes). Since
+   there's no WiFi-join QR, the SSID/password banner on the overlay is the only way
+   to join on this tier — it must stay legible and prominent.
+3. **Legacy `setWifiApEnabled` reflection (API < 26)** — fixed `CymaDisplay-<suffix>` /
+   `cyma102030`, stable BSP gateway. Unaffected by the above; some boxes report a
+   higher Android version than they actually run (e.g. an "Android 12" MXQ-PRO that's
+   really API 24 and takes this path).
+
+**Not achievable without root** (confirmed, don't re-litigate): binding port 80, and
+DNS-based captive-portal auto-popup (no DNS interceptor runs on the hotspot — see
+`CaptivePortalServer` kdoc). The portal always runs on 8080 and won't auto-open on
+the phone; the QR code (encoding the full portal URL, so no one types `:8080`) is
+the deliberate, permanent substitute for both — but it's only reachable *after* the
+phone has manually joined the hotspot (there is no join QR).
 
 **The join depends on device-owner status.** A non-privileged app on Android 10+
 cannot silently join an arbitrary WiFi network; a device owner can. Provision each
@@ -136,9 +168,14 @@ box once at the warehouse (no accounts on the device):
 
 ```bash
 adb shell dpm set-device-owner com.cyma.videoloop/.admin.CymaAdminReceiver
+adb shell appops set com.cyma.videoloop WRITE_SETTINGS allow
 # verify:
 adb shell dumpsys device_policy | grep -i "Device Owner"
 ```
+
+Both commands are required on **every** box now, regardless of API level — the
+`WRITE_SETTINGS` appop backs both the legacy tier and the API 26+ tether tier, not
+just pre-O boxes as before.
 
 Device-owner status also lets `DeviceOwnerManager` self-grant `ACCESS_FINE_LOCATION`
 (needed by the scan + hotspot APIs) with no on-device prompt — essential on a
@@ -151,5 +188,7 @@ Key invariants:
   result is cached for the portal dropdown.
 - **Success = validated internet** — `WifiJoiner` only reports success once the box
   actually reaches the internet, so a wrong password or captive AP re-arms the hotspot.
+- **Teardown must match what started** — `SoftApController` tracks which of the three
+  mechanisms is active and `stop()` tears down exactly that one.
 - The captive portal serves **cleartext to the phone** (inbound); `cleartextTrafficPermitted="false"`
   governs only the box app's own outbound traffic, so no `network_security_config` change is needed.

@@ -14,11 +14,13 @@
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
-    <!-- WRITE_SETTINGS lets the legacy tethering-hotspot path (API < 26) author
-         the AP config via WifiManager.setWifiApEnabled. On API 23+ it is gated at
-         runtime by an appop; the warehouse provisioning step runs
-         `adb shell appops set com.cyma.videoloop WRITE_SETTINGS allow` to enable it.
-         Auto-granted on install below API 23. -->
+    <!-- WRITE_SETTINGS backs the AP-config write on BOTH the legacy tethering-hotspot
+         path (API < 26) AND the fixed-credential tethering tier tried first on API
+         26+ (see SoftApController.startTetheredHotspot) before it falls back to
+         OS-random LocalOnlyHotspot. On API 23+ it is gated at runtime by an appop;
+         the warehouse provisioning step runs
+         `adb shell appops set com.cyma.videoloop WRITE_SETTINGS allow` on EVERY box
+         (not just pre-O ones) to enable it. Auto-granted on install below API 23. -->
     <uses-permission android:name="android.permission.WRITE_SETTINGS" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
@@ -70,7 +72,8 @@
         <!-- Device-admin receiver. Provisioned once per box at the warehouse via
              `adb shell dpm set-device-owner com.cyma.videoloop/.admin.CymaAdminReceiver`
              followed by `adb shell appops set com.cyma.videoloop WRITE_SETTINGS allow`
-             (the latter backs the legacy tethering-hotspot path on API < 26).
+             on every box, regardless of API level (backs both the legacy tethering
+             path on API < 26 and the fixed-credential tethering tier on API 26+).
              Device-owner status is what lets the app silently self-grant the
              location permission and program the WiFi config during setup. -->
         <receiver

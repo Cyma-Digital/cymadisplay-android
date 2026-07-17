@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -26,6 +27,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.cyma.videoloop.util.generateQrBitmap
@@ -68,52 +70,94 @@ fun WifiSetupOverlay(
     }
 }
 
+/**
+ * Two-step flow: (1) join the shown network manually on the phone — the SSID/
+ * password banner is the "notification", read directly off this card, not a QR —
+ * then (2) scan the single QR (or type the URL) to open the setup page. There's
+ * no WiFi-join QR: the phone must already be on the hotspot before the portal is
+ * reachable at all.
+ */
 @Composable
 private fun AwaitingPhoneContent(state: ProvisioningState.AwaitingPhone) {
     Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-        val qr = remember(state.qrPayload) { generateQrBitmap(state.qrPayload, 400) }
-        Box(
-            modifier = Modifier.size(160.dp).clip(RoundedCornerShape(8.dp)).background(Color.White),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (qr != null) {
-                Image(
-                    bitmap = qr,
-                    contentDescription = "QR code de configuração de WiFi",
-                    modifier = Modifier.fillMaxSize().padding(10.dp),
-                    contentScale = ContentScale.Fit,
-                )
-            }
-        }
-        Column(modifier = Modifier.width(280.dp)) {
+        Column(modifier = Modifier.width(300.dp)) {
             Text("Este display precisa de WiFi", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.size(8.dp))
             if (state.retryAfterFailure) {
                 Text(
-                    "Não foi possível conectar — senha incorreta? Escaneie novamente para tentar de novo.",
+                    "Não foi possível conectar — senha incorreta? Tente de novo.",
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Spacer(Modifier.size(8.dp))
             }
             Text(
-                "Escaneie com seu celular, escolha a rede WiFi e digite a senha.",
+                "Passo 1 — no seu celular, conecte-se a esta rede WiFi:",
                 style = MaterialTheme.typography.bodySmall,
             )
-            Spacer(Modifier.size(8.dp))
+            Spacer(Modifier.size(6.dp))
+            NetworkBanner(ssid = state.ssid, passphrase = state.passphrase)
+            Spacer(Modifier.size(12.dp))
             Text(
-                "Ou conecte-se a: ${state.ssid}",
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
+                if (state.portalUrl != null) {
+                    "Passo 2 — depois de conectar, escaneie o QR ao lado (ou acesse ${state.portalUrl})."
+                } else {
+                    "Passo 2 — depois de conectar, aguarde o endereço da página aparecer aqui."
+                },
+                style = MaterialTheme.typography.bodySmall,
             )
-            state.portalUrl?.let {
-                Text(
-                    "A página não abre? Acesse $it",
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 4.dp),
+        }
+        state.portalUrl?.let { url ->
+            QrTile(payload = url, contentDescription = "QR code da página de configuração")
+        }
+    }
+}
+
+/** Prominent SSID/password callout — the thing the installer actually reads to join. */
+@Composable
+private fun NetworkBanner(ssid: String, passphrase: String?) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.primaryContainer)
+            .padding(10.dp),
+    ) {
+        Text(
+            ssid,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp,
+            color = MaterialTheme.colorScheme.onPrimaryContainer,
+        )
+        Text(
+            if (passphrase != null) "Senha: $passphrase" else "Rede aberta (sem senha)",
+            fontFamily = FontFamily.Monospace,
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onPrimaryContainer,
+        )
+    }
+}
+
+@Composable
+private fun QrTile(payload: String, contentDescription: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        val qr = remember(payload) { generateQrBitmap(payload, 400) }
+        Box(
+            modifier = Modifier.size(150.dp).clip(RoundedCornerShape(8.dp)).background(Color.White),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (qr != null) {
+                Image(
+                    bitmap = qr,
+                    contentDescription = contentDescription,
+                    modifier = Modifier.fillMaxSize().padding(10.dp),
+                    contentScale = ContentScale.Fit,
                 )
             }
         }
+        Spacer(Modifier.size(4.dp))
+        Text("Abrir configuração", style = MaterialTheme.typography.labelSmall)
     }
 }
 

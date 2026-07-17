@@ -1,8 +1,8 @@
 package com.cyma.videoloop.wifi
 
+import android.os.SystemClock
 import android.util.Log
 import com.cyma.videoloop.admin.DeviceOwnerManager
-import com.cyma.videoloop.util.wifiQrPayload
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -31,7 +31,6 @@ sealed interface ProvisioningState {
     data object Preparing : ProvisioningState
     data class NeedsPermission(val permissions: List<String>) : ProvisioningState
     data class AwaitingPhone(
-        val qrPayload: String,
         val ssid: String,
         val passphrase: String?,
         val portalUrl: String?,
@@ -45,7 +44,10 @@ sealed interface ProvisioningState {
  * App-scoped driver of the WiFi-setup flow. Unlike a screen ViewModel this lives
  * for the whole process, so provisioning runs **in the background without ever
  * interrupting playback**: content keeps rendering while this raises the setup
- * hotspot + captive portal and surfaces a QR through [state] for a corner overlay.
+ * hotspot + captive portal and surfaces the SSID/password + a portal-URL QR
+ * through [state] for a corner overlay. There's no WiFi-join QR — the installer
+ * joins the network manually off the shown SSID/password, then scans the QR (or
+ * types the URL) to open the portal.
  *
  * It watches connectivity and self-manages:
  *  - internet lost  → wait a 15s grace for the WiFi client to (re)connect, then
@@ -78,6 +80,15 @@ class WifiProvisioningCoordinator @Inject constructor(
 
     @Volatile private var scanned: List<ScannedNetwork> = emptyList()
 
+    // Sliding deadline (elapsedRealtime-based) for the current session. Reset to
+    // "now + SESSION_MAX_MS" on start and on every credentials submit, so a couple
+    // of wrong-password retries don't burn through the window and trip the
+    // terminal stop mid-interaction; an abandoned box still goes quiet after
+    // SESSION_MAX_MS of no submits.
+    @Volatile private var sessionDeadline = 0L
+
+    private fun remainingMs(): Long = sessionDeadline - SystemClock.elapsedRealtime()
+
     // Set once the 3-min session deadline elapses with no success. Terminal for the
     // process lifetime (app-scoped @Singleton) → provisioning only resumes on reboot.
     private val provisioningStopped = AtomicBoolean(false)
@@ -104,11 +115,13 @@ class WifiProvisioningCoordinator @Inject constructor(
     private fun startSession(retryAfterFailure: Boolean) {
         if (provisioningStopped.get()) return
         if (sessionJob?.isActive == true) return
+        sessionDeadline = SystemClock.elapsedRealtime() + SESSION_MAX_MS
         sessionJob = scope.launch {
-            val finished = withTimeoutOrNull(SESSION_MAX_MS) { runSession(retryAfterFailure); true }
-            if (finished == null) {
-                // 3-min window elapsed with no internet → stop completely until reboot.
-                Log.i(TAG, "provisioning window ${SESSION_MAX_MS}ms elapsed — stopping until reboot")
+            val finished = runSession(retryAfterFailure)
+            if (!finished) {
+                // Deadline elapsed with no internet (and no credentials submit to
+                // extend it) → stop completely until reboot.
+                Log.i(TAG, "provisioning window elapsed — stopping until reboot")
                 provisioningStopped.set(true)
                 pendingCredentials = null
                 teardown()                                       // stops server + hotspot (frees radio)
@@ -123,14 +136,20 @@ class WifiProvisioningCoordinator @Inject constructor(
      * [GRACE_MS] window to (re)connect to a known network — the setup hotspot is
      * raised only if the box is still offline after it. The hotspot then stays up
      * until the phone submits credentials. A failed hotspot start or a failed join
-     * re-arms; the whole loop is bounded by [SESSION_MAX_MS] (enforced by the caller
-     * [startSession]), after which provisioning stops completely until reboot. A
-     * successful join validates internet, the connectivity watcher fires online, and
-     * [stopSession] cancels this loop.
+     * re-arms; the whole loop is bounded by [sessionDeadline] (started in
+     * [startSession] and pushed forward on every credentials submit in
+     * [awaitCredentials]), after which this returns `false` and the caller stops
+     * provisioning completely until reboot. A successful join validates internet,
+     * the connectivity watcher fires online, and [stopSession] cancels this loop.
+     *
+     * Returns `true` if the loop exited for any reason other than the deadline
+     * elapsing (online, needs-permission, or a successful join).
      */
-    private suspend fun runSession(retryAfterFailure: Boolean) {
+    private suspend fun runSession(retryAfterFailure: Boolean): Boolean {
         var retry = retryAfterFailure
         while (coroutineContext.isActive) {
+            if (remainingMs() <= 0) return false
+
             // 1. Grace window — give the WiFi client a chance to connect before the AP.
             _state.value = ProvisioningState.Preparing
 
@@ -138,28 +157,30 @@ class WifiProvisioningCoordinator @Inject constructor(
             deviceOwnerManager.grantWifiPermissions()
             if (!deviceOwnerManager.hasWifiRuntimePermissions()) {
                 _state.value = ProvisioningState.NeedsPermission(deviceOwnerManager.wifiRuntimePermissions)
-                return
+                return true
             }
 
             runCatching { wifiJoiner.ensureClientEnabled() }
-            if (connectivityMonitor.awaitValidatedInternet(GRACE_MS)) {
+            if (connectivityMonitor.awaitValidatedInternet(minOf(GRACE_MS, remainingMs()))) {
                 // Came online during the grace window — the watcher idles the overlay.
                 _state.value = ProvisioningState.Idle
-                return
+                return true
             }
+            if (remainingMs() <= 0) return false
 
             // 2. Still offline → scan (before the AP: single radio) and raise the hotspot.
             scanned = runCatching { wifiScanner.scan() }.getOrDefault(emptyList())
             when (val result = softAp.start()) {
                 is SoftApResult.Failed -> {
                     _state.value = ProvisioningState.Failed(result.reason)
-                    delay(RETRY_DELAY_MS)
+                    delay(minOf(RETRY_DELAY_MS, remainingMs()))
                     retry = true
                 }
                 is SoftApResult.Started -> {
-                    // 3. Hold the hotspot open until the phone submits (bounded by the
-                    //    session deadline in startSession, which cancels this loop).
-                    val (ssid, password) = awaitCredentials(result, retry)
+                    // 3. Hold the hotspot open until the phone submits — bounded by the
+                    //    current deadline, which each submit pushes forward.
+                    val creds = awaitCredentials(result, retry) ?: return false
+                    val (ssid, password) = creds
                     _state.value = ProvisioningState.Connecting(ssid)
                     // Let the "connecting…" page flush to the phone before we drop the AP.
                     delay(1_200)
@@ -167,26 +188,30 @@ class WifiProvisioningCoordinator @Inject constructor(
                     val online = runCatching { wifiJoiner.join(ssid, password) }.getOrDefault(false)
                     if (online) {
                         Log.i(TAG, "joined '$ssid' — online (watcher will idle the overlay)")
-                        return
+                        return true
                     }
                     Log.w(TAG, "join to '$ssid' failed — re-arming hotspot")
                     retry = true
                 }
             }
         }
+        return false
     }
 
     /**
      * Arms the captive portal, publishes [ProvisioningState.AwaitingPhone], and
-     * suspends until the phone submits credentials. The overall 3-min deadline is
-     * owned by [startSession], which cancels this loop on expiry. The captive server
-     * is left running on return — the caller tears it down (via [teardown]) so a
-     * "connecting…" page can flush first.
+     * suspends until the phone submits credentials or the current deadline elapses
+     * (returning null). A successful submit — right or wrong password — pushes
+     * [sessionDeadline] forward by [SESSION_MAX_MS], so a couple of retries never
+     * trip the terminal stop mid-interaction; an abandoned hotspot still times out.
+     * The captive server is left running on return — the caller tears it down (via
+     * [teardown]) so a "connecting…" page can flush first.
      */
     private suspend fun awaitCredentials(
         result: SoftApResult.Started,
         retry: Boolean,
-    ): Pair<String, String> {
+    ): Pair<String, String>? {
+        if (remainingMs() <= 0) return null
         val pending = CompletableDeferred<Pair<String, String>>()
         pendingCredentials = pending
         server = CaptivePortalServer.startOnAvailablePort(
@@ -196,17 +221,20 @@ class WifiProvisioningCoordinator @Inject constructor(
         val port = server?.listeningPort ?: CaptivePortalServer.PREFERRED_PORT
         val apIp = HotspotAddress.awaitApIpv4()
         _state.value = ProvisioningState.AwaitingPhone(
-            qrPayload = wifiQrPayload(result.credentials.ssid, result.credentials.passphrase),
             ssid = result.credentials.ssid,
             passphrase = result.credentials.passphrase,
             portalUrl = HotspotAddress.portalUrl(apIp, port),
             retryAfterFailure = retry,
         )
-        return try {
-            pending.await()
+        val creds = try {
+            withTimeoutOrNull(remainingMs()) { pending.await() }
         } finally {
             pendingCredentials = null
         }
+        if (creds != null) {
+            sessionDeadline = SystemClock.elapsedRealtime() + SESSION_MAX_MS
+        }
+        return creds
     }
 
     /** Phone submitted the form (server thread). Hands the creds to the session loop. */

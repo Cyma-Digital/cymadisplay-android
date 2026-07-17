@@ -30,25 +30,3 @@ fun generateQrBitmap(content: String, sizePx: Int): ImageBitmap? = runCatching {
         .apply { setPixels(pixels, 0, width, 0, 0, width, height) }
         .asImageBitmap()
 }.getOrNull()
-
-/**
- * Builds a `WIFI:` payload that phone camera/QR apps recognise as "join this
- * network", so scanning it connects the phone to the setup hotspot in one tap.
- * Open networks (no [passphrase]) use `T:nopass`.
- */
-fun wifiQrPayload(ssid: String, passphrase: String?): String {
-    val s = ssid.escapeWifiQr()
-    return if (passphrase.isNullOrEmpty()) {
-        "WIFI:S:$s;T:nopass;;"
-    } else {
-        "WIFI:S:$s;T:WPA;P:${passphrase.escapeWifiQr()};;"
-    }
-}
-
-/** Escapes the characters that are special inside a `WIFI:` payload. */
-private fun String.escapeWifiQr(): String = buildString {
-    for (c in this@escapeWifiQr) {
-        if (c == '\\' || c == ';' || c == ',' || c == ':' || c == '"') append('\\')
-        append(c)
-    }
-}
