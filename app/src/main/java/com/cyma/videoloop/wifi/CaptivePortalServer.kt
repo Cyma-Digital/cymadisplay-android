@@ -8,8 +8,8 @@ import fi.iki.elonen.NanoHTTPD
  * it has joined the setup hotspot.
  *
  * Two responsibilities:
- *  1. Serve `GET /` — a mobile form listing the pre-scanned networks (plus a
- *     manual-SSID field) and a password input.
+ *  1. Serve `GET /` — a mobile form listing the pre-scanned networks in a
+ *     dropdown and a password input.
  *  2. Answer the OS captive-portal *probe* URLs (`/generate_204`, Apple/Windows
  *     equivalents, …) with a redirect to `/`, which nudges the phone to pop the
  *     "Sign in to network" sheet automatically. Auto-open is best-effort — the
@@ -22,7 +22,6 @@ import fi.iki.elonen.NanoHTTPD
 class CaptivePortalServer(
     port: Int,
     private val networksProvider: () -> List<ScannedNetwork>,
-    private val onRescanRequested: () -> Unit,
     private val onSubmit: (ssid: String, password: String) -> Unit,
 ) : NanoHTTPD(port) {
 
@@ -32,11 +31,6 @@ class CaptivePortalServer(
 
         if (session.method == Method.POST && uri == "/connect") {
             return handleConnect(session)
-        }
-        if (uri == "/rescan") {
-            // Kick off an async rescan; the page reloads the form once it's done.
-            onRescanRequested()
-            return newFixedLengthResponse(Response.Status.OK, MIME_HTML, renderRescanning())
         }
         if (uri in PROBE_PATHS) {
             // 302 back to the portal so the phone flags the network as captive.
@@ -51,15 +45,13 @@ class CaptivePortalServer(
         val body = HashMap<String, String>()
         runCatching { session.parseBody(body) }
         val params = session.parameters
-        val picked = params["ssid"]?.firstOrNull().orEmpty().trim()
-        val manual = params["ssid_manual"]?.firstOrNull().orEmpty().trim()
-        val ssid = manual.ifEmpty { picked }
+        val ssid = params["ssid"]?.firstOrNull().orEmpty().trim()
         val password = params["password"]?.firstOrNull().orEmpty()
 
         if (ssid.isEmpty()) {
             return newFixedLengthResponse(
                 Response.Status.OK, MIME_HTML,
-                renderForm(error = "Please choose or type a network name."),
+                renderForm(error = "Selecione uma rede."),
             )
         }
 
@@ -74,13 +66,14 @@ class CaptivePortalServer(
         }
         val errorHtml = error?.let { "<p class=\"err\">${it.htmlEscape()}</p>" }.orEmpty()
         return """
-            <!doctype html><html><head>
+            <!doctype html><html lang="pt-BR"><head>
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <meta charset="utf-8">
-            <title>Connect this display to WiFi</title>
+            <title>Conectar este display ao WiFi</title>
             <style>
-              body{font-family:-apple-system,system-ui,sans-serif;margin:0;background:#0f1115;color:#e8eaed}
-              .card{max-width:420px;margin:0 auto;padding:24px}
+              body{font-family:-apple-system,system-ui,sans-serif;margin:0;background:#0f1115;color:#e8eaed;
+                min-height:100vh;display:flex;align-items:center;justify-content:center}
+              .card{max-width:420px;width:100%;box-sizing:border-box;padding:24px}
               h1{font-size:20px;margin:8px 0 16px}
               label{display:block;margin:16px 0 6px;font-size:13px;color:#9aa0a6}
               select,input{width:100%;box-sizing:border-box;padding:12px;font-size:16px;
@@ -89,49 +82,40 @@ class CaptivePortalServer(
                 border:0;border-radius:8px;background:#1a73e8;color:#fff}
               .err{color:#f28b82;font-size:14px}
               .hint{color:#9aa0a6;font-size:12px;margin-top:4px}
-              .row{display:flex;align-items:baseline;justify-content:space-between}
-              .rescan{color:#8ab4f8;font-size:13px;text-decoration:none}
+              .pw{position:relative}
+              .pw input{padding-right:44px}
+              .eye{position:absolute;right:6px;top:6px;bottom:6px;width:auto;margin:0;padding:0 8px;
+                background:none;border:0;color:#9aa0a6;font-size:18px;cursor:pointer}
             </style></head><body><div class="card">
-            <h1>Connect this display to WiFi</h1>
+            <h1>Conectar este display ao WiFi</h1>
             $errorHtml
             <form method="POST" action="/connect">
-              <div class="row"><label for="ssid">Network</label><a class="rescan" href="/rescan">↻ Rescan</a></div>
+              <label for="ssid">Rede</label>
               <select id="ssid" name="ssid">$options</select>
-              <label for="ssid_manual">Or type a network name</label>
-              <input id="ssid_manual" name="ssid_manual" placeholder="(optional — overrides the list)" autocomplete="off">
-              <label for="password">Password</label>
-              <input id="password" name="password" type="password" placeholder="Leave blank for open networks">
-              <button type="submit">Connect</button>
-              <p class="hint">The display will switch to this network and this setup page will disappear.</p>
+              <label for="password">Senha</label>
+              <div class="pw">
+                <input id="password" name="password" type="password" placeholder="Deixe em branco para redes abertas">
+                <button type="button" class="eye" aria-label="Mostrar senha"
+                  onclick="var p=document.getElementById('password');if(p.type==='password'){p.type='text';this.textContent='🙈';}else{p.type='password';this.textContent='👁';}">👁</button>
+              </div>
+              <button type="submit">Conectar</button>
+              <p class="hint">O display vai mudar para esta rede e esta página de configuração vai desaparecer.</p>
             </form>
             </div></body></html>
         """.trimIndent()
     }
 
-    private fun renderRescanning(): String = """
-        <!doctype html><html><head>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta charset="utf-8"><meta http-equiv="refresh" content="6;url=/">
-        <title>Rescanning…</title>
-        <style>body{font-family:-apple-system,system-ui,sans-serif;background:#0f1115;color:#e8eaed;
-          text-align:center;padding:48px 24px}h1{font-size:20px}p{color:#9aa0a6}
-          a{color:#8ab4f8}</style>
-        </head><body>
-        <h1>Rescanning nearby networks…</h1>
-        <p>This page will refresh in a few seconds. If it doesn't, <a href="/">tap here</a>.</p>
-        </body></html>
-    """.trimIndent()
-
     private fun renderConnecting(ssid: String): String = """
-        <!doctype html><html><head>
+        <!doctype html><html lang="pt-BR"><head>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta charset="utf-8"><title>Connecting…</title>
-        <style>body{font-family:-apple-system,system-ui,sans-serif;background:#0f1115;color:#e8eaed;
-          text-align:center;padding:48px 24px}h1{font-size:20px}p{color:#9aa0a6}</style>
+        <meta charset="utf-8"><title>Conectando…</title>
+        <style>body{font-family:-apple-system,system-ui,sans-serif;margin:0;background:#0f1115;color:#e8eaed;
+          text-align:center;padding:48px 24px;box-sizing:border-box;min-height:100vh;
+          display:flex;flex-direction:column;align-items:center;justify-content:center}h1{font-size:20px}p{color:#9aa0a6}</style>
         </head><body>
-        <h1>Connecting to ${ssid.htmlEscape()}…</h1>
-        <p>The display is switching networks. This setup hotspot will now disappear —
-        you can close this page. Check the display screen to confirm it's online.</p>
+        <h1>Conectando a ${ssid.htmlEscape()}…</h1>
+        <p>O display está trocando de rede. Este hotspot de configuração vai desaparecer —
+        você pode fechar esta página. Verifique a tela do display para confirmar que está online.</p>
         </body></html>
     """.trimIndent()
 
@@ -163,11 +147,10 @@ class CaptivePortalServer(
          */
         fun startOnAvailablePort(
             networksProvider: () -> List<ScannedNetwork>,
-            onRescanRequested: () -> Unit,
             onSubmit: (ssid: String, password: String) -> Unit,
         ): CaptivePortalServer? {
             for (port in intArrayOf(PREFERRED_PORT, FALLBACK_PORT)) {
-                val server = CaptivePortalServer(port, networksProvider, onRescanRequested, onSubmit)
+                val server = CaptivePortalServer(port, networksProvider, onSubmit)
                 if (server.startSafely()) return server
             }
             return null
