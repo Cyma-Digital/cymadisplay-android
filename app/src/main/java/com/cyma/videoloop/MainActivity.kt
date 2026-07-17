@@ -4,8 +4,6 @@ import android.app.AppOpsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
-import android.content.pm.PackageManager
-import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -72,8 +70,12 @@ class MainActivity : ComponentActivity() {
         // captive portal) without ever interrupting playback. App-scoped, so it
         // survives activity recreation.
         provisioningCoordinator.ensureRunning()
-        // Sane default before the schedule flow emits — avoids a brief portrait
-        // flash on cold start when the device is held vertically.
+        // Lock the physical panel to landscape for good. Signage boxes (e.g.
+        // Amlogic TX3) silently ignore setRequestedOrientation anyway, so we never
+        // rely on hardware rotation: every orientation from the schedule is applied
+        // in software by RotatedScreen below. Locking here just pins the panel to a
+        // known base so the software rotation is deterministic and there's no
+        // double-rotation on ROMs that *would* honour the request.
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         try { enableEdgeToEdge() } catch (_: Exception) {}
         // Kiosk-style immersive mode: hide status & navigation bars. They peek
@@ -82,10 +84,6 @@ class MainActivity : ComponentActivity() {
             hide(WindowInsetsCompat.Type.systemBars())
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
-        // TV/signage devices stay locked to landscape and silently ignore
-        // setRequestedOrientation — we rotate the Compose tree in software
-        // instead for vertical schedules.
-        val isTv = isTelevision()
         setContent {
             MaterialTheme {
                 val orientation by scheduleRepository.schedule()
@@ -94,13 +92,13 @@ class MainActivity : ComponentActivity() {
                     .collectAsState(initial = Orientation.HORIZONTAL)
 
                 LaunchedEffect(orientation) {
-                    android.util.Log.i("MainActivity", "orientation=$orientation isTv=$isTv")
-                    if (!isTv) {
-                        this@MainActivity.requestedOrientation = orientation.toActivityInfo()
-                    }
+                    android.util.Log.i("MainActivity", "orientation=$orientation")
                 }
 
-                RotatedScreen(degrees = if (isTv) orientation.softwareRotation() else 0f) {
+                // Always rotate in software off the schedule's orientation field.
+                // The panel is pinned landscape in onCreate, so this is the single
+                // source of truth for how content is oriented, regardless of ROM.
+                RotatedScreen(degrees = orientation.softwareRotation()) {
                     Surface(modifier = Modifier.fillMaxSize()) {
                         val navController = rememberNavController()
                         var startDestination by remember { mutableStateOf<String?>(null) }
@@ -246,19 +244,6 @@ private fun RotatedScreen(degrees: Float, content: @Composable () -> Unit) {
             placeable.place((outerW - childW) / 2, (outerH - childH) / 2)
         }
     }
-}
-
-private fun Context.isTelevision(): Boolean {
-    val uiMode = resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK
-    return uiMode == Configuration.UI_MODE_TYPE_TELEVISION ||
-            packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
-}
-
-private fun Orientation.toActivityInfo(): Int = when (this) {
-    Orientation.HORIZONTAL -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-    Orientation.VERTICAL -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-    Orientation.HORIZONTAL_INVERTED -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
-    Orientation.VERTICAL_INVERTED -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
 }
 
 private fun Orientation.softwareRotation(): Float = when (this) {
