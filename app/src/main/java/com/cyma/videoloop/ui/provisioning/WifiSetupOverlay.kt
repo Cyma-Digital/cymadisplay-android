@@ -57,8 +57,8 @@ fun WifiSetupOverlay(
         Card {
             when (state) {
                 is ProvisioningState.AwaitingPhone -> AwaitingPhoneContent(state)
-                is ProvisioningState.Connecting -> StatusRow("Connecting to ${state.ssid}…")
-                ProvisioningState.Preparing -> StatusRow("Starting WiFi setup…")
+                is ProvisioningState.Connecting -> StatusRow("Conectando a ${state.ssid}…")
+                ProvisioningState.Preparing -> StatusRow("Iniciando configuração de WiFi…")
                 is ProvisioningState.Failed ->
                     Text(state.message, color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodyMedium)
@@ -79,36 +79,36 @@ private fun AwaitingPhoneContent(state: ProvisioningState.AwaitingPhone) {
             if (qr != null) {
                 Image(
                     bitmap = qr,
-                    contentDescription = "WiFi setup QR code",
+                    contentDescription = "QR code de configuração de WiFi",
                     modifier = Modifier.fillMaxSize().padding(10.dp),
                     contentScale = ContentScale.Fit,
                 )
             }
         }
         Column(modifier = Modifier.width(280.dp)) {
-            Text("This display needs WiFi", style = MaterialTheme.typography.titleMedium)
+            Text("Este display precisa de WiFi", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.size(8.dp))
             if (state.retryAfterFailure) {
                 Text(
-                    "Couldn't connect — wrong password? Scan again to retry.",
+                    "Não foi possível conectar — senha incorreta? Escaneie novamente para tentar de novo.",
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Spacer(Modifier.size(8.dp))
             }
             Text(
-                "Scan with your phone, then pick your WiFi and enter its password.",
+                "Escaneie com seu celular, escolha a rede WiFi e digite a senha.",
                 style = MaterialTheme.typography.bodySmall,
             )
             Spacer(Modifier.size(8.dp))
             Text(
-                "Or join: ${state.ssid}",
+                "Ou conecte-se a: ${state.ssid}",
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.sp,
             )
             state.portalUrl?.let {
                 Text(
-                    "Page not opening? Browse to $it",
+                    "A página não abre? Acesse $it",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 4.dp),
                 )

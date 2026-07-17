@@ -41,7 +41,9 @@ import com.cyma.videoloop.domain.model.Orientation
 import com.cyma.videoloop.ui.pairing.PairingScreen
 import com.cyma.videoloop.ui.playback.PlaybackScreen
 import com.cyma.videoloop.ui.provisioning.WifiSetupOverlay
+import com.cyma.videoloop.ui.status.NetworkStatusIndicator
 import com.cyma.videoloop.ui.theme.CymaTheme
+import com.cyma.videoloop.wifi.ConnectivityMonitor
 import com.cyma.videoloop.wifi.ProvisioningState
 import com.cyma.videoloop.wifi.WifiProvisioningCoordinator
 import dagger.hilt.android.AndroidEntryPoint
@@ -55,6 +57,7 @@ class MainActivity : ComponentActivity() {
     @Inject lateinit var identity: DeviceIdentityRepository
     @Inject lateinit var scheduleRepository: ScheduleRepository
     @Inject lateinit var provisioningCoordinator: WifiProvisioningCoordinator
+    @Inject lateinit var connectivityMonitor: ConnectivityMonitor
 
     private val overlayPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -107,6 +110,11 @@ class MainActivity : ComponentActivity() {
                         val navController = rememberNavController()
                         var startDestination by remember { mutableStateOf<String?>(null) }
                         val provisioningState by provisioningCoordinator.state.collectAsState()
+                        // Plain collectAsState (not lifecycle-aware) so the 5 s
+                        // heartbeat never pauses; the remembered snapshot shows the
+                        // true state on the first frame (no red flash on cold start).
+                        val netStatus by connectivityMonitor.networkStatusFlow()
+                            .collectAsState(initial = remember { connectivityMonitor.currentStatus() })
                         LaunchedEffect(Unit) {
                             startDestination = resolveStartDestination()
                         }
@@ -144,6 +152,9 @@ class MainActivity : ComponentActivity() {
                                 state = provisioningState,
                                 onPermissionsGranted = { provisioningCoordinator.onPermissionsGranted() },
                             )
+                            // Drawn last = always on top of content and the WiFi
+                            // overlay. Bottom-right (overlay sits bottom-left).
+                            NetworkStatusIndicator(status = netStatus)
                         }
                     }
                 }

@@ -93,6 +93,13 @@ class WifiJoiner @Inject constructor(
         false
     }
 
+    /**
+     * Re-enables the WiFi client radio and waits for it to be ready. Called by the
+     * provisioning coordinator after it tears the setup hotspot down, so the box
+     * gets a chance to reconnect to a known network before the AP is re-armed.
+     */
+    suspend fun ensureClientEnabled() = awaitWifiClientReady()
+
     /** Ensures wifi is back in client ([WIFI_STATE_ENABLED]) mode after AP teardown. */
     @Suppress("DEPRECATION")
     private suspend fun awaitWifiClientReady() {
