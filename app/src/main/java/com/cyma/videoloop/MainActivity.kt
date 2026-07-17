@@ -41,6 +41,7 @@ import com.cyma.videoloop.domain.model.Orientation
 import com.cyma.videoloop.ui.pairing.PairingScreen
 import com.cyma.videoloop.ui.playback.PlaybackScreen
 import com.cyma.videoloop.ui.provisioning.WifiSetupOverlay
+import com.cyma.videoloop.ui.theme.CymaTheme
 import com.cyma.videoloop.wifi.ProvisioningState
 import com.cyma.videoloop.wifi.WifiProvisioningCoordinator
 import dagger.hilt.android.AndroidEntryPoint
@@ -85,7 +86,7 @@ class MainActivity : ComponentActivity() {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
         setContent {
-            MaterialTheme {
+            CymaTheme {
                 val orientation by scheduleRepository.schedule()
                     .map { it.orientation }
                     .distinctUntilChanged()
@@ -99,7 +100,10 @@ class MainActivity : ComponentActivity() {
                 // The panel is pinned landscape in onCreate, so this is the single
                 // source of truth for how content is oriented, regardless of ROM.
                 RotatedScreen(degrees = orientation.softwareRotation()) {
-                    Surface(modifier = Modifier.fillMaxSize()) {
+                    Surface(
+                        modifier = Modifier.fillMaxSize(),
+                        color = MaterialTheme.colorScheme.background,
+                    ) {
                         val navController = rememberNavController()
                         var startDestination by remember { mutableStateOf<String?>(null) }
                         val provisioningState by provisioningCoordinator.state.collectAsState()
