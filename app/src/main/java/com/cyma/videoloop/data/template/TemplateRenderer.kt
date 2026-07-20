@@ -45,7 +45,7 @@ class TemplateRenderer @Inject constructor() {
                 }
             }
         }
-        return rewriteAssetUrls(sanitizeLinks(stripEventHandlers(out)))
+        return injectViewportFitOverride(rewriteAssetUrls(sanitizeLinks(stripEventHandlers(out))))
     }
 
     private fun JsonElement.maybeContent(): String? = runCatching {
@@ -111,5 +111,33 @@ class TemplateRenderer @Inject constructor() {
             }
             return out
         }
+
+        private val HEAD_CLOSE_REGEX = Regex("""</head>""", RegexOption.IGNORE_CASE)
+
+        // Every production template so far authors `.body`/`.content` with a
+        // fixed `aspect-ratio` (e.g. 9/16 or 16/9) sized off one dimension
+        // (100vh or 100vw), assuming the viewport matches that ratio. Whichever
+        // templates don't match the device's actual viewport get letterboxed/
+        // pillarboxed. These are text-driven menu layouts built almost entirely
+        // from vh/vw units, so — unlike a photo/video background — stretching
+        // to fill the real viewport reflows the type scale instead of cropping
+        // list content, which a `cover`-style crop would risk cutting off.
+        private const val VIEWPORT_FIT_OVERRIDE = """<style>
+.body, .content {
+  aspect-ratio: auto !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: 100vw !important;
+  max-height: 100vh !important;
+}
+</style>
+</head>"""
+
+        fun injectViewportFitOverride(html: String): String =
+            if (HEAD_CLOSE_REGEX.containsMatchIn(html)) {
+                HEAD_CLOSE_REGEX.replaceFirst(html, VIEWPORT_FIT_OVERRIDE)
+            } else {
+                html
+            }
     }
 }

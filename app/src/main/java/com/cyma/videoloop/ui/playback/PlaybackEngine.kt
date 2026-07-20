@@ -1,12 +1,14 @@
 package com.cyma.videoloop.ui.playback
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.graphics.Color
 import android.graphics.SurfaceTexture
 import android.util.Log
 import android.view.Surface
 import android.view.SurfaceView
 import android.view.TextureView
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
@@ -14,18 +16,21 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
@@ -184,7 +189,106 @@ private fun ImageSlot(
 private const val TEMPLATE_ASSET_DOMAIN = "appassets.cyma.local"
 private const val TPL_TAG = "TplWebView"
 
+// How long to hold the WebView hidden after loadUrl() before revealing it.
+// `onPageFinished` (resource-fetch-complete) was tried as the reveal trigger
+// first, but measured via on-device screen recording: it fires near-instantly
+// for these locally-intercepted assets — well before Chromium has actually
+// painted the background image/border/font, not after. The real gap between
+// "cover bars visible" and "fully painted" measured ~170ms on-device; this
+// constant holds a bit longer than that for margin on slower templates/hardware.
+private const val FOUC_GATE_HOLD_MS = 450L
+
 @SuppressLint("SetJavaScriptEnabled")
+private fun buildTemplateWebView(context: Context, item: ResolvedItem.Template): WebView {
+    val templateRoot = item.indexFile.parentFile!!
+    val assetLoader = WebViewAssetLoader.Builder()
+        .setDomain(TEMPLATE_ASSET_DOMAIN)
+        .addPathHandler("/", InternalStoragePathHandler(context, templateRoot))
+        .build()
+
+    return WebView(context).apply {
+        // CSS in templates uses `100vh` / `5vh` heavily. Without explicit
+        // MATCH_PARENT layout params, WebView's default WRAP_CONTENT
+        // measures content first → content needs viewport height → WebView
+        // is still 0 tall → content collapses to 0 → WebView wraps to 0
+        // and we render a white screen with `font-size: 0`.
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+        // Templates set their own backgrounds via CSS, but a 16:9 template
+        // on a slightly-off-16:9 viewport letterboxes — keep the bars dark
+        // so they read as intentional rather than as a render glitch.
+        setBackgroundColor(Color.BLACK)
+        if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
+        settings.javaScriptEnabled = false
+        settings.allowFileAccess = false
+        settings.allowContentAccess = false
+        @Suppress("DEPRECATION")
+        setNetworkAvailable(false)
+        webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest,
+            ): WebResourceResponse? {
+                val path = request.url.path ?: "/"
+                if (path == "/favicon.ico") {
+                    return WebResourceResponse(
+                        "image/png", "utf-8",
+                        ByteArrayInputStream(ByteArray(0)),
+                    )
+                }
+                val response = assetLoader.shouldInterceptRequest(request.url)
+                if (response != null) {
+                    if (response.mimeType != null) {
+                        Log.d(TAG, "Template ${item.templateId} served ${request.url}")
+                        return response
+                    }
+                }
+                val urlStr = request.url.toString()
+                val assetPath = urlStr.substringAfter("cymadisplay.assets/", "").substringBefore('?')
+                if (assetPath.isNotEmpty()) {
+                    val localFile = File(templateRoot, assetPath)
+                    if (localFile.exists() && localFile.isFile) {
+                        val mime = URLConnection.guessContentTypeFromName(assetPath)
+                        Log.d(TAG, "Template ${item.templateId} intercepted S3 → $assetPath")
+                        return WebResourceResponse(
+                            mime, "utf-8", localFile.inputStream(),
+                        )
+                    }
+                }
+                if (response != null) {
+                    Log.w(TAG, "Template ${item.templateId} missing ${request.url}")
+                    return response
+                }
+                Log.w(TAG, "Template ${item.templateId} blocking ${request.url}")
+                return WebResourceResponse(
+                    "text/plain",
+                    "utf-8",
+                    ByteArrayInputStream(ByteArray(0)),
+                )
+            }
+
+            override fun shouldOverrideUrlLoading(
+                view: WebView,
+                request: WebResourceRequest,
+            ): Boolean = true
+        }
+        webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
+                val line = "${msg.message()} @${msg.sourceId()}:${msg.lineNumber()}"
+                when (msg.messageLevel()) {
+                    ConsoleMessage.MessageLevel.ERROR -> Log.e(TPL_TAG, line)
+                    ConsoleMessage.MessageLevel.WARNING -> Log.w(TPL_TAG, line)
+                    else -> Log.d(TPL_TAG, line)
+                }
+                return true
+            }
+        }
+        loadUrl("https://$TEMPLATE_ASSET_DOMAIN/index.html")
+    }
+}
+
 @Composable
 private fun TemplateSlot(
     item: ResolvedItem.Template,
@@ -200,96 +304,19 @@ private fun TemplateSlot(
         }
     }
 
-    val templateRoot = remember(item.templateId) { item.indexFile.parentFile!! }
-    val assetLoader = remember(item.templateId) {
-        WebViewAssetLoader.Builder()
-            .setDomain(TEMPLATE_ASSET_DOMAIN)
-            .addPathHandler("/", InternalStoragePathHandler(context, templateRoot))
-            .build()
-    }
+    var isReady by remember(item.indexFile) { mutableStateOf(false) }
+    val webView = remember(item.indexFile) { buildTemplateWebView(context, item) }
 
-    val webView = remember(item.indexFile) {
-        WebView(context).apply {
-            // CSS in templates uses `100vh` / `5vh` heavily. Without explicit
-            // MATCH_PARENT layout params, WebView's default WRAP_CONTENT
-            // measures content first → content needs viewport height → WebView
-            // is still 0 tall → content collapses to 0 → WebView wraps to 0
-            // and we render a white screen with `font-size: 0`.
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            )
-            // Templates set their own backgrounds via CSS, but a 16:9 template
-            // on a slightly-off-16:9 viewport letterboxes — keep the bars dark
-            // so they read as intentional rather than as a render glitch.
-            setBackgroundColor(Color.BLACK)
-            if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
-            settings.javaScriptEnabled = false
-            settings.allowFileAccess = false
-            settings.allowContentAccess = false
-            @Suppress("DEPRECATION")
-            setNetworkAvailable(false)
-            webViewClient = object : WebViewClient() {
-                override fun shouldInterceptRequest(
-                    view: WebView,
-                    request: WebResourceRequest,
-                ): WebResourceResponse? {
-                    val path = request.url.path ?: "/"
-                    if (path == "/favicon.ico") {
-                        return WebResourceResponse(
-                            "image/png", "utf-8",
-                            ByteArrayInputStream(ByteArray(0)),
-                        )
-                    }
-                    val response = assetLoader.shouldInterceptRequest(request.url)
-                    if (response != null) {
-                        if (response.mimeType != null) {
-                            Log.d(TAG, "Template ${item.templateId} served ${request.url}")
-                            return response
-                        }
-                    }
-                    val urlStr = request.url.toString()
-                    val assetPath = urlStr.substringAfter("cymadisplay.assets/", "").substringBefore('?')
-                    if (assetPath.isNotEmpty()) {
-                        val localFile = File(templateRoot, assetPath)
-                        if (localFile.exists() && localFile.isFile) {
-                            val mime = URLConnection.guessContentTypeFromName(assetPath)
-                            Log.d(TAG, "Template ${item.templateId} intercepted S3 → $assetPath")
-                            return WebResourceResponse(
-                                mime, "utf-8", localFile.inputStream(),
-                            )
-                        }
-                    }
-                    if (response != null) {
-                        Log.w(TAG, "Template ${item.templateId} missing ${request.url}")
-                        return response
-                    }
-                    Log.w(TAG, "Template ${item.templateId} blocking ${request.url}")
-                    return WebResourceResponse(
-                        "text/plain",
-                        "utf-8",
-                        ByteArrayInputStream(ByteArray(0)),
-                    )
-                }
-
-                override fun shouldOverrideUrlLoading(
-                    view: WebView,
-                    request: WebResourceRequest,
-                ): Boolean = true
-            }
-            webChromeClient = object : WebChromeClient() {
-                override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
-                    val line = "${msg.message()} @${msg.sourceId()}:${msg.lineNumber()}"
-                    when (msg.messageLevel()) {
-                        ConsoleMessage.MessageLevel.ERROR -> Log.e(TPL_TAG, line)
-                        ConsoleMessage.MessageLevel.WARNING -> Log.w(TPL_TAG, line)
-                        else -> Log.d(TPL_TAG, line)
-                    }
-                    return true
-                }
-            }
-            loadUrl("https://$TEMPLATE_ASSET_DOMAIN/index.html")
-        }
+    // The `::before` reveal-animation covers are pure CSS and paint within the
+    // first frame or two, well before the background image and custom font
+    // finish loading — showing the WebView live the instant loadUrl() fires
+    // flashes those solid cover bars over an otherwise-unloaded template.
+    // Hold reveal for a fixed grace period so the template pops in
+    // fully-formed instead (see FOUC_GATE_HOLD_MS for why this isn't gated
+    // on onPageFinished).
+    LaunchedEffect(item.indexFile) {
+        delay(FOUC_GATE_HOLD_MS)
+        isReady = true
     }
 
     DisposableEffect(webView) {
@@ -300,8 +327,18 @@ private fun TemplateSlot(
         }
     }
 
-    AndroidView(
-        factory = { webView },
-        modifier = Modifier.fillMaxSize(),
-    )
+    Box(modifier = Modifier.fillMaxSize().background(ComposeColor.Black)) {
+        // Neither Compose `alpha` nor an opaque Compose box drawn on top
+        // actually hid this WebView on-device (confirmed via screen
+        // recording — the FOUC frames stayed visible either way): this
+        // hardware composites the WebView's hardware layer outside Compose's
+        // normal draw/z-order pipeline. `View.INVISIBLE` operates a level
+        // lower — it tells the Android view system not to render the view at
+        // all, which this hardware does respect — so gate on that instead.
+        AndroidView(
+            factory = { webView },
+            update = { view -> view.visibility = if (isReady) View.VISIBLE else View.INVISIBLE },
+            modifier = Modifier.fillMaxSize(),
+        )
+    }
 }
