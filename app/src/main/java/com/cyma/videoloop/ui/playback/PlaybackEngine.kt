@@ -11,6 +11,7 @@ import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -200,19 +201,40 @@ private const val TPL_TAG = "TplWebView"
 // reveal anyway rather than leaving the WebView INVISIBLE forever.
 private const val FOUC_GATE_HOLD_MS = 2500L
 
+// After the visual-state callback reports the DOM drawable, Chromium may still
+// be rasterizing heavy backgrounds (the dense radial-gradient / bg image) tile
+// by tile. onComplete fires at DOM-ready, before those tiles finish. Because
+// the WebView is kept VISIBLE (behind a cover) it actually rasterizes during
+// this window, so holding a short settle after onComplete lets the raster
+// finish before we drop the cover — revealing a fully-painted page.
+private const val REVEAL_SETTLE_MS = 600L
+
+/**
+ * Builds the template view: a [FrameLayout] holding the [WebView] with an opaque
+ * black cover [View] stacked on top. The WebView is kept VISIBLE the whole time
+ * so Chromium actually rasterizes it — an INVISIBLE WebView defers rasterization
+ * entirely, so its heavy background would tile in visibly *after* being shown
+ * (confirmed on-device). The cover hides that raster until it completes; once the
+ * paint settles ([onReady]) [TemplateSlot] drops the cover to reveal a
+ * fully-painted page. Compose can't occlude this WebView on this hardware (it
+ * composites outside Compose's draw/z-order pipeline), but a native sibling in
+ * the same FrameLayout z-orders normally.
+ *
+ * Child 0 is the WebView, child 1 is the cover.
+ */
 @SuppressLint("SetJavaScriptEnabled")
-private fun buildTemplateWebView(
+private fun buildTemplateView(
     context: Context,
     item: ResolvedItem.Template,
     onReady: () -> Unit,
-): WebView {
+): FrameLayout {
     val templateRoot = item.indexFile.parentFile!!
     val assetLoader = WebViewAssetLoader.Builder()
         .setDomain(TEMPLATE_ASSET_DOMAIN)
         .addPathHandler("/", InternalStoragePathHandler(context, templateRoot))
         .build()
 
-    return WebView(context).apply {
+    val webView = WebView(context).apply {
         // Force a hardware layer. Templates paint a dense repeating
         // radial-gradient background (background-size: 1vh 1vh → thousands of
         // cells); software rasterization fills it in visibly tile-by-tile,
@@ -293,13 +315,21 @@ private fun buildTemplateWebView(
             override fun onPageFinished(view: WebView, url: String) {
                 // onPageFinished fires when resources are fetched, well before
                 // Chromium has painted. Use it only to request a visual-state
-                // callback, which fires once the current DOM state is actually
-                // drawable — reveal then so the tiled raster is never on screen.
+                // callback, which fires once the current DOM state is drawable.
+                Log.d(TPL_TAG, "onPageFinished ${item.templateId}")
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     view.postVisualStateCallback(
                         0L,
                         object : WebView.VisualStateCallback() {
-                            override fun onComplete(requestId: Long) = onReady()
+                            override fun onComplete(requestId: Long) {
+                                // DOM is drawable, but heavy-background tiles may
+                                // still be rasterizing — settle before revealing.
+                                Log.d(TPL_TAG, "visualState onComplete ${item.templateId}, settle ${REVEAL_SETTLE_MS}ms")
+                                view.postDelayed({
+                                    Log.d(TPL_TAG, "revealing ${item.templateId} (paint)")
+                                    onReady()
+                                }, REVEAL_SETTLE_MS)
+                            }
                         },
                     )
                 } else {
@@ -322,6 +352,25 @@ private fun buildTemplateWebView(
         }
         loadUrl("https://$TEMPLATE_ASSET_DOMAIN/index.html")
     }
+
+    // Opaque cover stacked on top of the (always-visible) WebView; dropped by
+    // TemplateSlot once the template has painted. Rotation-agnostic (plain black).
+    val cover = View(context).apply {
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+        setBackgroundColor(Color.BLACK)
+    }
+
+    return FrameLayout(context).apply {
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+        addView(webView)
+        addView(cover)
+    }
 }
 
 @Composable
@@ -340,39 +389,36 @@ private fun TemplateSlot(
     }
 
     var isReady by remember(item.indexFile) { mutableStateOf(false) }
-    val webView = remember(item.indexFile) {
-        // Reveal once the template has actually painted (visual-state callback),
-        // so the tiled raster of the dense background is never shown filling in.
-        buildTemplateWebView(context, item, onReady = { isReady = true })
+    val container = remember(item.indexFile) {
+        // Reveal (drop the cover) once the template has actually painted, so the
+        // tiled raster of the heavy background is never shown filling in.
+        buildTemplateView(context, item, onReady = { isReady = true })
     }
 
     // Safety-net timeout: if the paint callback never arrives (stuck load, or
-    // API < 23), reveal anyway so the WebView doesn't stay INVISIBLE forever.
+    // API < 23), drop the cover anyway so the template isn't hidden forever.
     // Whichever fires first wins; setting isReady twice is idempotent.
     LaunchedEffect(item.indexFile) {
         delay(FOUC_GATE_HOLD_MS)
         isReady = true
     }
 
-    DisposableEffect(webView) {
+    DisposableEffect(container) {
         onDispose {
             Log.d(TAG, "Releasing WebView for template ${item.templateId}")
-            webView.stopLoading()
-            webView.destroy()
+            (container.getChildAt(0) as? WebView)?.let {
+                it.stopLoading()
+                it.destroy()
+            }
         }
     }
 
     Box(modifier = Modifier.fillMaxSize().background(ComposeColor.Black)) {
-        // Neither Compose `alpha` nor an opaque Compose box drawn on top
-        // actually hid this WebView on-device (confirmed via screen
-        // recording — the FOUC frames stayed visible either way): this
-        // hardware composites the WebView's hardware layer outside Compose's
-        // normal draw/z-order pipeline. `View.INVISIBLE` operates a level
-        // lower — it tells the Android view system not to render the view at
-        // all, which this hardware does respect — so gate on that instead.
         AndroidView(
-            factory = { webView },
-            update = { view -> view.visibility = if (isReady) View.VISIBLE else View.INVISIBLE },
+            factory = { container },
+            // Drop the native cover (child 1) once painted. The WebView (child 0)
+            // stays VISIBLE throughout so it keeps rasterizing under the cover.
+            update = { fl -> fl.getChildAt(1).visibility = if (isReady) View.GONE else View.VISIBLE },
             modifier = Modifier.fillMaxSize(),
         )
     }
