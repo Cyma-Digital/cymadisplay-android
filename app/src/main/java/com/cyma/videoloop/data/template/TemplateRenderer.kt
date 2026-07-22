@@ -122,6 +122,14 @@ class TemplateRenderer @Inject constructor() {
         // from vh/vw units, so — unlike a photo/video background — stretching
         // to fill the real viewport reflows the type scale instead of cropping
         // list content, which a `cover`-style crop would risk cutting off.
+        //
+        // We also disable all CSS animations/transitions. Templates ship a
+        // `translateZ` 3D `fade-in-fwd` entrance animation on their text blocks;
+        // on the weak signage GPU that promotes a compositing layer and stutters
+        // visibly. This is a static kiosk loop revealed only once it has fully
+        // painted (see PlaybackEngine.FOUC gate), so an entrance animation adds
+        // nothing and only introduces jank — neutralize it so the template pops
+        // in fully-formed and static.
         private const val VIEWPORT_FIT_OVERRIDE = """<style>
 .body, .content {
   aspect-ratio: auto !important;
@@ -129,6 +137,10 @@ class TemplateRenderer @Inject constructor() {
   height: 100vh !important;
   max-width: 100vw !important;
   max-height: 100vh !important;
+}
+*, *::before, *::after {
+  animation: none !important;
+  transition: none !important;
 }
 </style>
 </head>"""

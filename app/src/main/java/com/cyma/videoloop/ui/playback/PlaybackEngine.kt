@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
 import android.graphics.SurfaceTexture
+import android.os.Build
 import android.util.Log
 import android.view.Surface
 import android.view.SurfaceView
@@ -189,17 +190,22 @@ private fun ImageSlot(
 private const val TEMPLATE_ASSET_DOMAIN = "appassets.cyma.local"
 private const val TPL_TAG = "TplWebView"
 
-// How long to hold the WebView hidden after loadUrl() before revealing it.
-// `onPageFinished` (resource-fetch-complete) was tried as the reveal trigger
-// first, but measured via on-device screen recording: it fires near-instantly
-// for these locally-intercepted assets — well before Chromium has actually
-// painted the background image/border/font, not after. The real gap between
-// "cover bars visible" and "fully painted" measured ~170ms on-device; this
-// constant holds a bit longer than that for margin on slower templates/hardware.
-private const val FOUC_GATE_HOLD_MS = 450L
+// Reveal is now gated on actual paint completion (postVisualStateCallback,
+// wired in buildTemplateWebView), not a blind timer. `onPageFinished`
+// (resource-fetch-complete) fires near-instantly for these locally-intercepted
+// assets — well before Chromium has painted — so it alone is too early; we use
+// it only as the trigger to *request* the visual-state callback, which fires
+// once the DOM is actually drawable. This constant is the safety-net timeout:
+// if the callback never arrives (stuck load, or API < 23 with no callback),
+// reveal anyway rather than leaving the WebView INVISIBLE forever.
+private const val FOUC_GATE_HOLD_MS = 2500L
 
 @SuppressLint("SetJavaScriptEnabled")
-private fun buildTemplateWebView(context: Context, item: ResolvedItem.Template): WebView {
+private fun buildTemplateWebView(
+    context: Context,
+    item: ResolvedItem.Template,
+    onReady: () -> Unit,
+): WebView {
     val templateRoot = item.indexFile.parentFile!!
     val assetLoader = WebViewAssetLoader.Builder()
         .setDomain(TEMPLATE_ASSET_DOMAIN)
@@ -207,6 +213,16 @@ private fun buildTemplateWebView(context: Context, item: ResolvedItem.Template):
         .build()
 
     return WebView(context).apply {
+        // Force a hardware layer. Templates paint a dense repeating
+        // radial-gradient background (background-size: 1vh 1vh → thousands of
+        // cells); software rasterization fills it in visibly tile-by-tile,
+        // top-left→bottom-right, on the weak signage GPU. A hardware layer is
+        // GPU-rasterized (cheap) and — unlike the default compositing path on
+        // this hardware — is composited by the render thread *with* ancestor
+        // transforms, so the software screen-rotation (RotatedScreen's
+        // rotationZ) actually applies to the WebView instead of leaving it
+        // offset/clipped in inverted orientations.
+        setLayerType(View.LAYER_TYPE_HARDWARE, null)
         // CSS in templates uses `100vh` / `5vh` heavily. Without explicit
         // MATCH_PARENT layout params, WebView's default WRAP_CONTENT
         // measures content first → content needs viewport height → WebView
@@ -273,6 +289,25 @@ private fun buildTemplateWebView(context: Context, item: ResolvedItem.Template):
                 view: WebView,
                 request: WebResourceRequest,
             ): Boolean = true
+
+            override fun onPageFinished(view: WebView, url: String) {
+                // onPageFinished fires when resources are fetched, well before
+                // Chromium has painted. Use it only to request a visual-state
+                // callback, which fires once the current DOM state is actually
+                // drawable — reveal then so the tiled raster is never on screen.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    view.postVisualStateCallback(
+                        0L,
+                        object : WebView.VisualStateCallback() {
+                            override fun onComplete(requestId: Long) = onReady()
+                        },
+                    )
+                } else {
+                    // No postVisualStateCallback before API 23; the timeout
+                    // fallback in TemplateSlot handles the reveal instead.
+                    onReady()
+                }
+            }
         }
         webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
@@ -305,15 +340,15 @@ private fun TemplateSlot(
     }
 
     var isReady by remember(item.indexFile) { mutableStateOf(false) }
-    val webView = remember(item.indexFile) { buildTemplateWebView(context, item) }
+    val webView = remember(item.indexFile) {
+        // Reveal once the template has actually painted (visual-state callback),
+        // so the tiled raster of the dense background is never shown filling in.
+        buildTemplateWebView(context, item, onReady = { isReady = true })
+    }
 
-    // The `::before` reveal-animation covers are pure CSS and paint within the
-    // first frame or two, well before the background image and custom font
-    // finish loading — showing the WebView live the instant loadUrl() fires
-    // flashes those solid cover bars over an otherwise-unloaded template.
-    // Hold reveal for a fixed grace period so the template pops in
-    // fully-formed instead (see FOUC_GATE_HOLD_MS for why this isn't gated
-    // on onPageFinished).
+    // Safety-net timeout: if the paint callback never arrives (stuck load, or
+    // API < 23), reveal anyway so the WebView doesn't stay INVISIBLE forever.
+    // Whichever fires first wins; setting isReady twice is idempotent.
     LaunchedEffect(item.indexFile) {
         delay(FOUC_GATE_HOLD_MS)
         isReady = true
