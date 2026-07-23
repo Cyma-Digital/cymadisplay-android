@@ -1,9 +1,19 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.hilt.android)
     alias(libs.plugins.ksp)
+}
+
+// Release signing. Credentials live in `keystore.properties` at the repo root
+// (gitignored) alongside the keystore. When absent (fresh clone / CI without the
+// key), the release build stays unsigned rather than failing.
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
 }
 
 android {
@@ -22,6 +32,17 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            if (keystorePropsFile.exists()) {
+                storeFile = rootProject.file(keystoreProps["storeFile"] as String)
+                storePassword = keystoreProps["storePassword"] as String
+                keyAlias = keystoreProps["keyAlias"] as String
+                keyPassword = keystoreProps["keyPassword"] as String
+            }
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
@@ -35,6 +56,8 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            // Signed only when keystore.properties is present; otherwise unsigned.
+            signingConfig = if (keystorePropsFile.exists()) signingConfigs.getByName("release") else null
             buildConfigField("String", "API_BASE_URL", "\"https://www.cymadisplay.com/api/v2/\"")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
