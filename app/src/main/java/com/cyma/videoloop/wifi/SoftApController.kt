@@ -137,6 +137,7 @@ class SoftApController @Inject constructor(
                     reservation = res
                     active = Mechanism.LOHS
                     val creds = res.readCredentials()
+                    if (creds != null) logCredentials("LOHS", creds)
                     if (cont.isActive) {
                         cont.resume(
                             if (creds != null) SoftApResult.Started(creds)
@@ -242,6 +243,15 @@ class SoftApController @Inject constructor(
             Log.i(TAG, "tether tier unavailable (config read-back failed) → LOHS")
             return null
         }
+        // The read-back is the preferred source (it's what the AP actually applied), but
+        // some ROMs — Q especially — hand back the config with preSharedKey null/masked.
+        // We know what we just persisted, so substitute it: publishing a null passphrase
+        // here would render a `T:nopass` join QR for an AP that is really WPA2, and the
+        // phone would join-and-fail with no visible reason.
+        val credentials = SoftApCredentials(
+            ssid = readBack.ssid.ifBlank { ssid },
+            passphrase = readBack.passphrase?.ifBlank { null } ?: HOTSPOT_PASSPHRASE,
+        )
 
         if (!TetherReflection.startTethering(context)) {
             Log.i(TAG, "tether tier unavailable (startTethering reflection failed) → LOHS")
@@ -250,9 +260,9 @@ class SoftApController @Inject constructor(
 
         return when (awaitApState(AP_UP_TIMEOUT_MS)) {
             ApState.Enabled -> {
-                Log.i(TAG, "hotspot tier: TETHER — up as ${readBack.ssid}")
+                logCredentials("TETHER", credentials)
                 active = Mechanism.TETHER
-                SoftApResult.Started(readBack)
+                SoftApResult.Started(credentials)
             }
             else -> {
                 Log.i(TAG, "tether tier unavailable (AP didn't come up) → LOHS")
@@ -360,9 +370,10 @@ class SoftApController @Inject constructor(
     private suspend fun waitForApUp(ssid: String, passphrase: String?): SoftApResult =
         when (awaitApState(AP_UP_TIMEOUT_MS)) {
             ApState.Enabled -> {
-                Log.i(TAG, "legacy hotspot up: $ssid")
+                val credentials = SoftApCredentials(ssid = ssid, passphrase = passphrase)
+                logCredentials("LEGACY", credentials)
                 active = Mechanism.LEGACY
-                SoftApResult.Started(SoftApCredentials(ssid = ssid, passphrase = passphrase))
+                SoftApResult.Started(credentials)
             }
             ApState.Failed -> SoftApResult.Failed("The setup hotspot failed to come up on this ROM.")
             null -> SoftApResult.Failed("The setup hotspot didn't come up in time. Try again.")
@@ -421,6 +432,21 @@ class SoftApController @Inject constructor(
         ApReflection.STATE_ENABLED -> ApState.Enabled
         ApReflection.STATE_FAILED -> ApState.Failed
         else -> null
+    }
+
+    /**
+     * Records which tier came up and whether it produced a usable passphrase. The
+     * overlay renders these credentials into a `WIFI:` join QR, so a null passphrase
+     * here means "the QR will say open network" — the one failure that looks like a
+     * working hotspot from the outside. Passphrase length only; the value itself is
+     * already on screen, no need to also put it in logcat.
+     */
+    private fun logCredentials(tier: String, creds: SoftApCredentials) {
+        Log.i(
+            TAG,
+            "hotspot tier: $tier — up as '${creds.ssid}' " +
+                "passphrase=${creds.passphrase?.let { "present(${it.length} chars)" } ?: "NULL (open network)"}",
+        )
     }
 
     /** Last 4 chars of the canonical device ID (sha256(ANDROID_ID)[0..9]) — identical to the ID paired with the pairing code. */

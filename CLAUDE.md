@@ -72,7 +72,10 @@ com.cyma.videoloop/
 │   └── QrCode.kt                 ZXing QR bitmap + WIFI: payload builder
 ├── ui/
 │   ├── provisioning/
-│   │   └── WifiSetupOverlay.kt   corner QR/status overlay driven by WifiProvisioningCoordinator.state
+│   │   ├── WifiSetupOverlay.kt   corner overlay container; dispatches WifiProvisioningCoordinator.state
+│   │   ├── WifiJoinCard.kt       step 1: WIFI: join QR + SSID/password banner fallback
+│   │   ├── PortalAccessCard.kt   step 2: portal-URL QR (+ typed URL fallback)
+│   │   └── ProvisioningCommon.kt shared card/QrTile/NetworkBanner/StatusRow + compact sizes
 │   ├── playback/
 │   │   ├── PlaybackViewModel.kt  @HiltViewModel; collects schedule → materializes each item → emits PlaybackUiState
 │   │   ├── PlaybackScreen.kt     observes ViewModel; shows DownloadDialog or PlaybackEngine or ErrorScreen
@@ -115,18 +118,34 @@ Defined per build type in `app/build.gradle.kts` as `buildConfigField("String", 
 
 ## WiFi provisioning
 
-Provisioning runs **in the background and never interrupts playback**.
-`WifiProvisioningCoordinator` (app-scoped `@Singleton`, its own scope) watches
-`ConnectivityMonitor.validatedInternetFlow()`: internet lost → raise a hotspot +
-captive portal and publish `ProvisioningState`; internet gained → tear everything
-down (`Idle`). `MainActivity` calls `coordinator.ensureRunning()` and renders
-`WifiSetupOverlay` — a corner card — on top of the always-running content
-(`PlaybackScreen`/pairing). The card is **two steps, no WiFi-join QR**: step 1 is a
-prominent SSID/password banner the installer reads and joins manually on the phone
-(there's nothing to scan for this step — the hotspot must be joined before the
-portal is reachable at all); step 2 is a single QR encoding the portal URL (or the
-URL as text) that opens the captive-portal form (`CaptivePortalServer`, NanoHTTPD:
-SSID dropdown + password + rescan). On submit the box tears the hotspot down
+Provisioning runs **in the background and never interrupts playback**, and it is
+**boot-only**. `WifiProvisioningCoordinator` (app-scoped `@Singleton`, its own scope)
+starts exactly one session from `ensureRunning()` at process start: a 1-min
+`GRACE_MS` window in which the WiFi client can associate with an already-configured
+network (Android takes a while after a cold boot — measured ~17 s on the TX3), state
+held at `Idle` so an online box never flashes setup UI; still offline after it → raise
+hotspot + captive portal. `ConnectivityMonitor.validatedInternetFlow()` is watched only
+for internet *gained* → tear everything down (`Idle`) and mark provisioning terminal.
+**Losing internet later, mid-operation, deliberately does not raise the hotspot** —
+recovery from a mid-run outage is a reboot. `MainActivity` calls
+`coordinator.ensureRunning()` and renders `WifiSetupOverlay` on top of the
+always-running content (`PlaybackScreen`/pairing).
+
+The overlay is **two cards stacked vertically** in a corner (`WifiJoinCard` +
+`PortalAccessCard`, shared helpers in `ProvisioningCommon.kt`), in the order they're
+performed:
+- **Step 1 — join the box's hotspot.** A `WIFI:` join QR (`util/QrCode.wifiQrPayload`,
+  parsed natively by Android 10+ camera/Lens and iOS 11+ Camera) **plus** the
+  prominent SSID/password banner as the fallback for phones that can't scan `WIFI:`
+  payloads. This QR is scannable *before* the phone has any link to the box — only the
+  step-2 portal URL depends on the join. The banner must stay legible: on the
+  `LocalOnlyHotspot` tier the credentials are OS-random (`AndroidShare_6325`).
+- **Step 2 — open the portal.** A QR encoding the full portal URL (so nobody types an
+  IP and `:8080`), reachable only once the phone is on the hotspot, opening the
+  captive-portal form (`CaptivePortalServer`, NanoHTTPD: SSID dropdown + password +
+  rescan). Shows "aguarde o endereço" until the AP interface has an IPv4.
+
+On submit the box tears the hotspot down
 (single-radio boxes can't host an AP and be a client at once) and joins via
 `WifiJoiner`; once internet validates, the connectivity watcher idles the overlay
 automatically. A failed join re-arms the hotspot (and pushes the session deadline
@@ -143,24 +162,47 @@ some mechanisms let the app pick its own SSID/passphrase/gateway:
    stable per device (often `192.168.43.1`). Gated behind the `WRITE_SETTINGS` appop
    and per-OEM/per-API reflection support (Android Q's stricter config-write gating
    often blocks it outright) — any failure returns `null` and falls through to tier 2,
-   it never surfaces a broken/guessed-credentials hotspot.
+   it never surfaces a broken/guessed-credentials hotspot. The config read-back is the
+   preferred credential source, but when a ROM hands it back with `preSharedKey`
+   null/masked the passphrase we just persisted is substituted — publishing a null
+   there would render a `T:nopass` join QR for an AP that is really WPA2, and the phone
+   would join-and-fail invisibly.
 2. **`LocalOnlyHotspot` (API 26+ fallback)** — the OS chooses SSID, passphrase, and
    gateway subnet, and they can change on every start. This is why some boxes show a
    random SSID like `AndroidShare_6325` instead of `CymaDisplay-*` — expected on ROMs
-   where tier 1 doesn't apply (e.g. confirmed on API 29 Amlogic TX3 boxes). Since
-   there's no WiFi-join QR, the SSID/password banner on the overlay is the only way
-   to join on this tier — it must stay legible and prominent.
+   where tier 1 doesn't apply (e.g. confirmed on API 29 Amlogic TX3 boxes). The step-1
+   join QR is regenerated from the live reservation on every start, so the random creds
+   still need no typing; the banner beside it stays the fallback.
 3. **Legacy `setWifiApEnabled` reflection (API < 26)** — fixed `CymaDisplay-<suffix>` /
    `cyma102030`, stable BSP gateway. Unaffected by the above; some boxes report a
    higher Android version than they actually run (e.g. an "Android 12" MXQ-PRO that's
    really API 24 and takes this path).
 
-**Not achievable without root** (confirmed, don't re-litigate): binding port 80, and
+**The join must nudge the framework — `enableNetwork` alone does nothing.**
+`addNetwork` + `enableNetwork(netId, disableOthers = true)` only *marks the config
+enabled*; the connection is initiated by `WifiConnectivityManager` on its next
+connectivity scan, whose 20/40/80 s back-off produced a measured **81 s of dead air**
+after a portal submit on the API 29 TX3. `WifiManager.reconnect()` is the call that
+would force it, but for apps targeting Q+ it's a documented no-op ("will always fail
+and return false") — the device-owner exemption covers
+`addNetwork`/`enableNetwork`/`setWifiEnabled`, **not** `reconnect()`. So `WifiJoiner`
+escalates nudges instead: `startScan()` → second `startScan()` → a client-radio
+off/on bounce (also DO-exempt), waiting for association between each. Association is
+the *only* slow step — measured costs once associated: DHCP ~1 s, `NetworkMonitor`
+validation ~1 s. `join()` therefore waits on association (polling
+`connectionInfo.ssid`) rather than blind-waiting on validation, and returns a
+`JoinResult`: `Online` / `AssociatedNoInternet` (dead upstream — don't tell the
+installer it's a wrong password) / `NotAssociated` (wrong password or out of range).
+Diagnose any future slow join off `WifiJoiner`'s `elapsedMs` logs against those numbers.
+
+**Not achievable without root** (confirmed, don't re-litigate): binding port 80 (so the
+portal binds 8080 only — the old port-80-first attempt just logged an `EACCES`
+`BindException` every session), and
 DNS-based captive-portal auto-popup (no DNS interceptor runs on the hotspot — see
 `CaptivePortalServer` kdoc). The portal always runs on 8080 and won't auto-open on
-the phone; the QR code (encoding the full portal URL, so no one types `:8080`) is
+the phone; the step-2 QR (encoding the full portal URL, so no one types `:8080`) is
 the deliberate, permanent substitute for both — but it's only reachable *after* the
-phone has manually joined the hotspot (there is no join QR).
+phone is on the hotspot, which is what the separate step-1 join QR is for.
 
 **The join depends on device-owner status.** A non-privileged app on Android 10+
 cannot silently join an arbitrary WiFi network; a device owner can. Provision each

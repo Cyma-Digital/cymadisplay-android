@@ -29,12 +29,26 @@ import kotlin.coroutines.coroutineContext
 sealed interface ProvisioningState {
     data object Idle : ProvisioningState
     data object Preparing : ProvisioningState
+
+    /**
+     * A join attempt has been made and we're waiting to see whether it reached the
+     * internet. Distinct from [Preparing] (which means "about to raise the hotspot"):
+     * a join that validates *just* after [WifiJoiner]'s own timeout lands here, and
+     * mislabelling it as Preparing made a working connection look like a restart.
+     */
+    data object Verifying : ProvisioningState
     data class NeedsPermission(val permissions: List<String>) : ProvisioningState
     data class AwaitingPhone(
         val ssid: String,
         val passphrase: String?,
         val portalUrl: String?,
-        val retryAfterFailure: Boolean,
+        /**
+         * Why the previous attempt failed, or null on the first arming. Carries the
+         * reason rather than a bare flag: "wrong password" and "joined the AP but it
+         * has no internet" need different advice, and showing the former for the
+         * latter sends the installer chasing the wrong problem.
+         */
+        val retryReason: String?,
     ) : ProvisioningState
     data class Connecting(val ssid: String) : ProvisioningState
     data class Failed(val message: String) : ProvisioningState
@@ -49,17 +63,27 @@ sealed interface ProvisioningState {
  * joins the network manually off the shown SSID/password, then scans the QR (or
  * types the URL) to open the portal.
  *
- * It watches connectivity and self-manages:
- *  - internet lost  → wait a 15s grace for the WiFi client to (re)connect, then
- *    raise hotspot + portal and publish [ProvisioningState.AwaitingPhone]
- *  - internet gained → tear everything down, back to [ProvisioningState.Idle]
- *  - a session runs at most [SESSION_MAX_MS] (3 min); if it hasn't reached the
+ * **Provisioning is boot-only.** Exactly one session is started, from
+ * [ensureRunning] at process start (i.e. right after the box powers up):
+ *  - first a [GRACE_MS] (1 min) window in which the WiFi client can (re)connect to
+ *    an already-configured network — Android needs a while to do that after boot,
+ *    so a box that comes up online never raises the hotspot at all. The overlay
+ *    stays [ProvisioningState.Idle] (nothing shown) for the whole grace window
+ *  - still offline after it → raise hotspot + portal and publish
+ *    [ProvisioningState.AwaitingPhone]
+ *  - internet gained at any point → tear everything down, back to
+ *    [ProvisioningState.Idle]
+ *  - the session runs at most [SESSION_MAX_MS] (5 min); if it hasn't reached the
  *    internet by then it **stops completely** — hotspot down, overlay [Idle], WiFi
  *    client re-enabled to roam — and stays off until the process restarts (reboot).
  *
+ * Losing internet *later*, while the box is already running, deliberately does
+ * **not** raise the hotspot — the connectivity watcher only reacts to coming
+ * online (to tear down). Recovery from a mid-run outage is a reboot.
+ *
  * Sequencing mirrors [WifiScanner]/[SoftApController]/[WifiJoiner]: scan before
  * the hotspot (single radio), tear the hotspot down before joining, re-arm on a
- * failed join (all bounded by the 3-min session deadline).
+ * failed join (all bounded by the session deadline).
  */
 @Singleton
 class WifiProvisioningCoordinator @Inject constructor(
@@ -89,22 +113,32 @@ class WifiProvisioningCoordinator @Inject constructor(
 
     private fun remainingMs(): Long = sessionDeadline - SystemClock.elapsedRealtime()
 
-    // Set once the 3-min session deadline elapses with no success. Terminal for the
-    // process lifetime (app-scoped @Singleton) → provisioning only resumes on reboot.
+    // Set once the session deadline elapses with no success, or once the box is online.
+    // Terminal for the process lifetime (app-scoped @Singleton) → provisioning only
+    // resumes on reboot.
     private val provisioningStopped = AtomicBoolean(false)
 
     // Signal from the captive-portal server thread → the session loop. Non-null only
     // while the loop is awaiting a credentials submit for the currently-armed hotspot.
     private var pendingCredentials: CompletableDeferred<Pair<String, String>>? = null
 
-    /** Start watching connectivity. Idempotent — safe to call from every onCreate. */
+    /**
+     * Starts the single boot provisioning session and the connectivity watcher.
+     * Idempotent — safe to call from every onCreate.
+     */
     fun ensureRunning() {
         if (watcherStarted) return
         watcherStarted = true
+        // Boot-only: one session, started here at process start. Its first phase is the
+        // GRACE_MS window, so an already-configured box that connects on its own never
+        // raises the hotspot.
+        startSession(retryAfterFailure = false)
         scope.launch {
             connectivityMonitor.validatedInternetFlow().distinctUntilChanged().collect { online ->
                 Log.i(TAG, "connectivity online=$online")
-                if (online) stopSession() else startSession(retryAfterFailure = false)
+                // Only coming *online* is reactive (tear everything down). Going offline
+                // later must NOT raise the hotspot — it comes up at boot only.
+                if (online) stopSession()
             }
         }
     }
@@ -115,7 +149,9 @@ class WifiProvisioningCoordinator @Inject constructor(
     private fun startSession(retryAfterFailure: Boolean) {
         if (provisioningStopped.get()) return
         if (sessionJob?.isActive == true) return
-        sessionDeadline = SystemClock.elapsedRealtime() + SESSION_MAX_MS
+        // Grace window is on top of the AP window, so the hotspot really is reachable
+        // for SESSION_MAX_MS and not SESSION_MAX_MS minus the grace.
+        sessionDeadline = SystemClock.elapsedRealtime() + GRACE_MS + SESSION_MAX_MS
         sessionJob = scope.launch {
             val finished = runSession(retryAfterFailure)
             if (!finished) {
@@ -146,12 +182,16 @@ class WifiProvisioningCoordinator @Inject constructor(
      * elapsing (online, needs-permission, or a successful join).
      */
     private suspend fun runSession(retryAfterFailure: Boolean): Boolean {
-        var retry = retryAfterFailure
+        var retry: String? = if (retryAfterFailure) RETRY_GENERIC else null
         while (coroutineContext.isActive) {
             if (remainingMs() <= 0) return false
 
             // 1. Grace window — give the WiFi client a chance to connect before the AP.
-            _state.value = ProvisioningState.Preparing
+            //    Stay silent (Idle) through it on the first pass: a box that connects on
+            //    its own must never flash a WiFi-setup overlay at boot. On a retry pass
+            //    a join was already attempted, so this window is really "did it work?" —
+            //    Verifying, not Preparing.
+            _state.value = if (retry != null) ProvisioningState.Verifying else ProvisioningState.Idle
 
             // Device owner grants silently; otherwise the overlay must ask.
             deviceOwnerManager.grantWifiPermissions()
@@ -169,12 +209,13 @@ class WifiProvisioningCoordinator @Inject constructor(
             if (remainingMs() <= 0) return false
 
             // 2. Still offline → scan (before the AP: single radio) and raise the hotspot.
+            _state.value = ProvisioningState.Preparing
             scanned = runCatching { wifiScanner.scan() }.getOrDefault(emptyList())
             when (val result = softAp.start()) {
                 is SoftApResult.Failed -> {
                     _state.value = ProvisioningState.Failed(result.reason)
                     delay(minOf(RETRY_DELAY_MS, remainingMs()))
-                    retry = true
+                    retry = RETRY_GENERIC
                 }
                 is SoftApResult.Started -> {
                     // 3. Hold the hotspot open until the phone submits — bounded by the
@@ -185,13 +226,29 @@ class WifiProvisioningCoordinator @Inject constructor(
                     // Let the "connecting…" page flush to the phone before we drop the AP.
                     delay(1_200)
                     teardown()
-                    val online = runCatching { wifiJoiner.join(ssid, password) }.getOrDefault(false)
-                    if (online) {
-                        Log.i(TAG, "joined '$ssid' — online (watcher will idle the overlay)")
-                        return true
+                    // Verifying is published from inside the join, the moment supplicant
+                    // actually associates — before that we're still connecting.
+                    val joinResult = runCatching {
+                        wifiJoiner.join(ssid, password) { _state.value = ProvisioningState.Verifying }
+                    }.getOrElse {
+                        Log.w(TAG, "join to '$ssid' threw", it)
+                        JoinResult.NotAssociated
                     }
-                    Log.w(TAG, "join to '$ssid' failed — re-arming hotspot")
-                    retry = true
+                    when (joinResult) {
+                        JoinResult.Online -> {
+                            Log.i(TAG, "joined '$ssid' — online (watcher will idle the overlay)")
+                            return true
+                        }
+                        JoinResult.AssociatedNoInternet -> {
+                            Log.w(TAG, "'$ssid' joined but has no internet — re-arming hotspot")
+                            retry = "Conectou a \"$ssid\", mas essa rede não tem internet. " +
+                                "Verifique o roteador ou escolha outra rede."
+                        }
+                        JoinResult.NotAssociated -> {
+                            Log.w(TAG, "join to '$ssid' never associated — re-arming hotspot")
+                            retry = RETRY_GENERIC
+                        }
+                    }
                 }
             }
         }
@@ -209,7 +266,7 @@ class WifiProvisioningCoordinator @Inject constructor(
      */
     private suspend fun awaitCredentials(
         result: SoftApResult.Started,
-        retry: Boolean,
+        retryReason: String?,
     ): Pair<String, String>? {
         if (remainingMs() <= 0) return null
         val pending = CompletableDeferred<Pair<String, String>>()
@@ -218,13 +275,13 @@ class WifiProvisioningCoordinator @Inject constructor(
             networksProvider = { scanned },
             onSubmit = { ssid, password -> onCredentialsSubmitted(ssid, password) },
         )
-        val port = server?.listeningPort ?: CaptivePortalServer.PREFERRED_PORT
+        val port = server?.listeningPort ?: CaptivePortalServer.PORTAL_PORT
         val apIp = HotspotAddress.awaitApIpv4()
         _state.value = ProvisioningState.AwaitingPhone(
             ssid = result.credentials.ssid,
             passphrase = result.credentials.passphrase,
             portalUrl = HotspotAddress.portalUrl(apIp, port),
-            retryAfterFailure = retry,
+            retryReason = retryReason,
         )
         val creds = try {
             withTimeoutOrNull(remainingMs()) { pending.await() }
@@ -242,7 +299,12 @@ class WifiProvisioningCoordinator @Inject constructor(
         scope.launch { pendingCredentials?.complete(ssid to password) }
     }
 
+    /**
+     * Online → nothing left to provision. Terminal for the process lifetime: the box
+     * is configured, and a later outage must not bring the hotspot back (boot-only).
+     */
     private fun stopSession() {
+        provisioningStopped.set(true)
         sessionJob?.cancel()
         sessionJob = null
         pendingCredentials = null
@@ -259,13 +321,21 @@ class WifiProvisioningCoordinator @Inject constructor(
     private companion object {
         private const val TAG = "WifiProvisioning"
 
-        /** Grace given to the WiFi client to (re)connect before the setup AP is raised. */
-        private const val GRACE_MS = 15_000L
+        /**
+         * Grace given to the WiFi client to (re)connect before the setup AP is raised.
+         * 1 min: after a cold boot Android can take a good while to associate with an
+         * already-configured network, and raising the AP earlier would steal the radio.
+         */
+        private const val GRACE_MS = 60_000L
 
         /** Whole provisioning session lives at most this long; then it stops until reboot. */
-        private const val SESSION_MAX_MS = 180_000L
+        private const val SESSION_MAX_MS = 300_000L
 
         /** Backoff before retrying after a failed hotspot start. */
         private const val RETRY_DELAY_MS = 20_000L
+
+        /** Shown when the box never associated — by far the most common cause is a typo'd password. */
+        private const val RETRY_GENERIC =
+            "Não foi possível conectar — senha incorreta? Tente de novo."
     }
 }

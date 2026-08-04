@@ -130,9 +130,13 @@ class CaptivePortalServer(
     companion object {
         private const val TAG = "CaptivePortalServer"
 
-        /** Preferred port (best captive auto-open); [FALLBACK_PORT] if it can't bind. */
-        const val PREFERRED_PORT = 80
-        const val FALLBACK_PORT = 8080
+        /**
+         * The only port the portal ever binds. Port 80 — which is what would give the
+         * best captive auto-open — needs root: an unprivileged bind always fails with
+         * `EACCES`, so trying it first only produced a `BindException` stacktrace in
+         * every session's log that reads like a real failure. Don't re-add it.
+         */
+        const val PORTAL_PORT = 8080
 
         private val PROBE_PATHS = setOf(
             "/generate_204", "/gen_204",           // Android
@@ -141,19 +145,13 @@ class CaptivePortalServer(
             "/canonical.html", "/success.txt",     // Firefox / misc
         )
 
-        /**
-         * Binds [PREFERRED_PORT] if possible, else [FALLBACK_PORT]. Returns the
-         * started server, or null if neither port could be bound.
-         */
+        /** Starts the portal on [PORTAL_PORT]. Returns null if it couldn't bind. */
         fun startOnAvailablePort(
             networksProvider: () -> List<ScannedNetwork>,
             onSubmit: (ssid: String, password: String) -> Unit,
         ): CaptivePortalServer? {
-            for (port in intArrayOf(PREFERRED_PORT, FALLBACK_PORT)) {
-                val server = CaptivePortalServer(port, networksProvider, onSubmit)
-                if (server.startSafely()) return server
-            }
-            return null
+            val server = CaptivePortalServer(PORTAL_PORT, networksProvider, onSubmit)
+            return if (server.startSafely()) server else null
         }
     }
 }
