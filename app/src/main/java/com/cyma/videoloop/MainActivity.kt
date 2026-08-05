@@ -40,12 +40,9 @@ import com.cyma.videoloop.data.schedule.ScheduleRepository
 import com.cyma.videoloop.domain.model.Orientation
 import com.cyma.videoloop.ui.pairing.PairingScreen
 import com.cyma.videoloop.ui.playback.PlaybackScreen
-import com.cyma.videoloop.ui.provisioning.WifiSetupOverlay
 import com.cyma.videoloop.ui.status.NetworkStatusIndicator
 import com.cyma.videoloop.ui.theme.CymaTheme
 import com.cyma.videoloop.wifi.ConnectivityMonitor
-import com.cyma.videoloop.wifi.ProvisioningState
-import com.cyma.videoloop.wifi.WifiProvisioningCoordinator
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -56,7 +53,8 @@ class MainActivity : ComponentActivity() {
 
     @Inject lateinit var identity: DeviceIdentityRepository
     @Inject lateinit var scheduleRepository: ScheduleRepository
-    @Inject lateinit var provisioningCoordinator: WifiProvisioningCoordinator
+    // No WifiProvisioningCoordinator here — see the note in onCreate. ConnectivityMonitor
+    // stays: it backs the on-screen network-status dot, which is not part of provisioning.
     @Inject lateinit var connectivityMonitor: ConnectivityMonitor
 
     private val overlayPermissionLauncher = registerForActivityResult(
@@ -70,10 +68,12 @@ class MainActivity : ComponentActivity() {
         // exemption the boot receiver needs to relaunch after a reboot. Prompt for
         // it on launch until it's explicitly allowed.
         ensureOverlayPermission()
-        // Watch connectivity in the background and run WiFi setup (hotspot +
-        // captive portal) without ever interrupting playback. App-scoped, so it
-        // survives activity recreation.
-        provisioningCoordinator.ensureRunning()
+        // NOTE: WiFi provisioning is deliberately DISABLED on this branch — this box
+        // must never raise a setup hotspot; its WiFi is configured by hand through the
+        // device's own Android Settings. The feature's code is still present under
+        // wifi/ and ui/provisioning/ but nothing drives it: `ensureRunning()` is not
+        // called here and `WifiSetupOverlay` is not rendered below. Those two call
+        // sites are the whole switch — restore them (see `main`) to re-enable.
         // Lock the physical panel to landscape for good. Signage boxes (e.g.
         // Amlogic TX3) silently ignore setRequestedOrientation anyway, so we never
         // rely on hardware rotation: every orientation from the schedule is applied
@@ -109,7 +109,6 @@ class MainActivity : ComponentActivity() {
                     ) {
                         val navController = rememberNavController()
                         var startDestination by remember { mutableStateOf<String?>(null) }
-                        val provisioningState by provisioningCoordinator.state.collectAsState()
                         // Plain collectAsState (not lifecycle-aware) so the 5 s
                         // heartbeat never pauses; the remembered snapshot shows the
                         // true state on the first frame (no red flash on cold start).
@@ -132,8 +131,8 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
-                        // Content is the always-on base layer; WiFi setup renders
-                        // as a corner overlay on top of it and never replaces it.
+                        // Content is the always-on base layer. (On `main` the WiFi
+                        // setup overlay draws on top of it; disabled here.)
                         Box(modifier = Modifier.fillMaxSize()) {
                             when (startDestination) {
                                 null -> SplashScreen()
@@ -148,12 +147,7 @@ class MainActivity : ComponentActivity() {
                                     composable("playback") { PlaybackScreen() }
                                 }
                             }
-                            WifiSetupOverlay(
-                                state = provisioningState,
-                                onPermissionsGranted = { provisioningCoordinator.onPermissionsGranted() },
-                            )
-                            // Drawn last = always on top of content and the WiFi
-                            // overlay. Bottom-right (overlay sits bottom-left).
+                            // Drawn last = always on top of content. Bottom-right.
                             NetworkStatusIndicator(status = netStatus)
                         }
                     }

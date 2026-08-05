@@ -118,6 +118,16 @@ Defined per build type in `app/build.gradle.kts` as `buildConfigField("String", 
 
 ## WiFi provisioning
 
+> **DISABLED ON THIS BRANCH (`no-wifi-provisioning`).** The box must never raise a
+> setup hotspot here — its WiFi is configured by hand through the device's own Android
+> Settings. The code below is all still present and compiles, but nothing drives it:
+> `MainActivity` does not call `coordinator.ensureRunning()` and does not render
+> `WifiSetupOverlay`. Those two call sites are the entire switch; restore them (see
+> `main`) to re-enable. Everything after this banner describes the behavior **on
+> `main`** and stays accurate for the code that's in the tree — don't "fix" the missing
+> call. The manifest still declares the WiFi/location permissions; they're unreachable
+> with no code path running.
+
 Provisioning runs **in the background and never interrupts playback**, and it is
 **boot-only**. `WifiProvisioningCoordinator` (app-scoped `@Singleton`, its own scope)
 starts exactly one session from `ensureRunning()` at process start: a 1-min
