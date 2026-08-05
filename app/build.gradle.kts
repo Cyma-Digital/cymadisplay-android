@@ -84,6 +84,20 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    // This branch ships the variant with WiFi provisioning disabled, so its release
+    // artifact is named `release-no-op.apk` instead of `app-release.apk`. Both branches
+    // build to the same directory, and the two APKs are otherwise indistinguishable on
+    // disk — installing the wrong one on a box is silent and only shows up as an AP
+    // that does (or doesn't) come up at boot.
+    applicationVariants.all {
+        if (buildType.name == "release") {
+            outputs.all {
+                (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl)
+                    .outputFileName = "release-no-op.apk"
+            }
+        }
+    }
 }
 
 dependencies {
