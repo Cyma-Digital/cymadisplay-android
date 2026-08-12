@@ -16,6 +16,20 @@ val keystoreProps = Properties().apply {
     if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
 }
 
+// Secrets that must not be committed. `.env` is gitignored (see `.env.example` for
+// the template); a missing file or key yields "" so a fresh clone still builds —
+// the feature that needs the key degrades instead of breaking the build.
+val dotEnvFile = rootProject.file(".env")
+val dotEnv = Properties().apply {
+    if (dotEnvFile.exists()) dotEnvFile.inputStream().use { load(it) }
+}
+fun secret(name: String): String = (dotEnv[name] as String?)?.trim().orEmpty()
+
+val geolocationApiKey = secret("GEOLOCATION_API_KEY")
+if (geolocationApiKey.isEmpty()) {
+    logger.warn("WARNING: GEOLOCATION_API_KEY missing from .env — device metrics will report null coordinates.")
+}
+
 android {
     namespace = "com.cyma.videoloop"
     compileSdk = 34
@@ -48,6 +62,8 @@ android {
             isMinifyEnabled = false
             isShrinkResources = false
             buildConfigField("String", "API_BASE_URL", "\"https://www.cymadisplay.com/api/v2/\"")
+            buildConfigField("String", "METRICS_BASE_URL", "\"https://metrics.cyma.digital/\"")
+            buildConfigField("String", "GEOLOCATION_API_KEY", "\"$geolocationApiKey\"")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -59,6 +75,8 @@ android {
             // Signed only when keystore.properties is present; otherwise unsigned.
             signingConfig = if (keystorePropsFile.exists()) signingConfigs.getByName("release") else null
             buildConfigField("String", "API_BASE_URL", "\"https://www.cymadisplay.com/api/v2/\"")
+            buildConfigField("String", "METRICS_BASE_URL", "\"https://metrics.cyma.digital/\"")
+            buildConfigField("String", "GEOLOCATION_API_KEY", "\"$geolocationApiKey\"")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

@@ -2,6 +2,7 @@ package com.cyma.videoloop.di
 
 import com.cyma.videoloop.BuildConfig
 import com.cyma.videoloop.data.api.CymaApi
+import com.cyma.videoloop.data.api.MetricsApi
 import com.cyma.videoloop.data.identity.DeviceIdentityRepository
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import dagger.Module
@@ -19,6 +20,7 @@ import java.util.concurrent.TimeUnit
 import javax.inject.Singleton
 
 private val BASE_URL = BuildConfig.API_BASE_URL
+private val METRICS_BASE_URL = BuildConfig.METRICS_BASE_URL
 
 @Module
 @InstallIn(SingletonComponent::class)
@@ -71,4 +73,23 @@ object NetworkModule {
     @Provides
     @Singleton
     fun cymaApi(retrofit: Retrofit): CymaApi = retrofit.create(CymaApi::class.java)
+
+    /**
+     * Metrics reporting lives on a different host from the playlist API, so it
+     * needs its own [Retrofit]. The OkHttp client is shared — the auth header is
+     * harmless there, and the timeouts are the same.
+     */
+    @Provides
+    @Singleton
+    @Metrics
+    fun metricsRetrofit(client: OkHttpClient, json: Json): Retrofit =
+        Retrofit.Builder()
+            .baseUrl(METRICS_BASE_URL)
+            .client(client)
+            .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+            .build()
+
+    @Provides
+    @Singleton
+    fun metricsApi(@Metrics retrofit: Retrofit): MetricsApi = retrofit.create(MetricsApi::class.java)
 }

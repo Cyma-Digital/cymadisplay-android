@@ -18,6 +18,13 @@ import kotlin.coroutines.resume
 data class ScannedNetwork(val ssid: String, val rssi: Int, val secured: Boolean)
 
 /**
+ * One *physical* access point — unlike [ScannedNetwork], which collapses a
+ * multi-AP SSID into a single entry. WiFi trilateration needs every BSSID it can
+ * see, so this keeps them separate.
+ */
+data class ScannedAccessPoint(val bssid: String, val rssi: Int, val channel: Int?)
+
+/**
  * Scans for nearby WiFi networks so the captive portal can present a picker.
  *
  * This runs **before** the setup hotspot is started: a single-radio box in AP
@@ -60,6 +67,36 @@ class WifiScanner @Inject constructor(
             .sortedByDescending { it.rssi }
     }
 
+    /**
+     * Triggers a scan and returns every visible BSSID, strongest first — the input
+     * to WiFi trilateration (see [com.cyma.videoloop.data.metrics.GeoLocationRepository]).
+     *
+     * Same single-radio caveat as [scan]: don't call this while the setup hotspot
+     * is up. The caller gates on validated internet, which implies the AP is down.
+     */
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
+    suspend fun scanAccessPoints(timeoutMs: Long = 8_000): List<ScannedAccessPoint> {
+        ensureWifiEnabled()
+        awaitFreshScan(timeoutMs)
+        return runCatching { wifiManager.scanResults }
+            .getOrDefault(emptyList())
+            .asSequence()
+            .mapNotNull { result ->
+                val bssid = result.BSSID?.lowercase() ?: return@mapNotNull null
+                // Skip junk / hidden entries the way geolocation.py does (len != 17)
+                if (bssid.length != 17) return@mapNotNull null
+                ScannedAccessPoint(
+                    bssid = bssid,
+                    rssi = result.level,
+                    channel = channelForFrequency(result.frequency),
+                )
+            }
+            .distinctBy { it.bssid }
+            .sortedByDescending { it.rssi }
+            .toList()
+    }
+
     @Suppress("DEPRECATION")
     private fun ensureWifiEnabled() {
         if (!wifiManager.isWifiEnabled) {
@@ -98,6 +135,14 @@ class WifiScanner @Inject constructor(
     private companion object {
         private const val TAG = "WifiScanner"
     }
+}
+
+/** Centre frequency (MHz) → 802.11 channel number; null for bands we don't map. */
+private fun channelForFrequency(freqMhz: Int): Int? = when (freqMhz) {
+    2484 -> 14
+    in 2412..2472 -> (freqMhz - 2407) / 5
+    in 5000..5900 -> (freqMhz - 5000) / 5
+    else -> null
 }
 
 private fun String.isSecured(): Boolean =

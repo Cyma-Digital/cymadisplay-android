@@ -22,6 +22,8 @@ local.properties
 *.jks
 keystore.properties
 google-services.json
+.env
+!.env.example
 
 # IntelliJ / Android Studio
 .idea/

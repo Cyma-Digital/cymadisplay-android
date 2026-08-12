@@ -37,7 +37,7 @@ All dependency versions are in `gradle/libs.versions.toml`.
 
 ```
 com.cyma.videoloop/
-├── App.kt                        HiltAndroidApp; enqueues ScheduleSyncWorker on boot
+├── App.kt                        HiltAndroidApp; enqueues ScheduleSyncWorker + starts MetricsReporter on boot
 ├── MainActivity.kt               @AndroidEntryPoint thin shell; hosts NavHost + WiFi-setup overlay on top
 ├── admin/
 │   ├── CymaAdminReceiver.kt      DeviceAdminReceiver; provisioned via `dpm set-device-owner`
@@ -46,16 +46,24 @@ com.cyma.videoloop/
 │   ├── WifiProvisioningCoordinator.kt  app-scoped state machine; watches connectivity, runs setup in background
 │   ├── ConnectivityMonitor.kt    validated-internet snapshot + flow + awaitValidatedInternet(timeout)
 │   ├── WifiScanner.kt            startScan → List<ScannedNetwork> (run BEFORE the hotspot)
+│   │                             + scanAccessPoints() → per-BSSID list for trilateration
 │   ├── SoftApController.kt       LocalOnlyHotspot wrapper → SoftApResult (creds or a failure reason)
 │   ├── CaptivePortalServer.kt    NanoHTTPD form on the hotspot; SSID dropdown + password + rescan; intercepts OS probes
 │   ├── WifiJoiner.kt             DO addNetwork/enableNetwork/reconnect (+ suggestion fallback) → await internet
 │   └── HotspotAddress.kt         resolves the hotspot gateway IP for the on-screen fallback URL
 ├── di/
 │   ├── NetworkModule.kt          OkHttp + Retrofit + CymaApi; reads API_BASE_URL from BuildConfig
+│   │                             + @Metrics Retrofit (METRICS_BASE_URL) + MetricsApi
+│   ├── Metrics.kt                @Qualifier for the metrics-host Retrofit
 │   └── StorageModule.kt          DataStore<Preferences> singleton
 ├── data/
 │   ├── api/CymaApi.kt            Retrofit interface + DTOs (schedule, pair, device status)
+│   ├── api/MetricsApi.kt         send2 POST + Google geolocate (@Url); DeviceMetricsDto
 │   ├── identity/DeviceIdentityRepository.kt   device ID + pairing code via DataStore
+│   ├── metrics/
+│   │   ├── MetricsReporter.kt    app-scoped 5-min POST loop; started from App.onCreate
+│   │   ├── MetricsCollector.kt   reads temp/disk/RAM/CPU/WiFi/IP; every metric nullable
+│   │   └── GeoLocationRepository.kt  boot-only WiFi trilateration; fix cached in DataStore
 │   ├── schedule/
 │   │   ├── ScheduleStore.kt      DataStore wrapper; holds current Schedule JSON; ships default hardcoded schedule
 │   │   └── ScheduleRepository.kt  exposes schedule() Flow; syncFromNetwork() stub for Phase 3
@@ -114,7 +122,77 @@ com.cyma.videoloop/
 
 ### API base URL
 
-Defined per build type in `app/build.gradle.kts` as `buildConfigField("String", "API_BASE_URL", ...)`. Change both `debug` and `release` when pointing at a new backend.
+Defined per build type in `app/build.gradle.kts` as `buildConfigField("String", "API_BASE_URL", ...)`. Change both `debug` and `release` when pointing at a new backend. Same for `METRICS_BASE_URL` (the metrics host is a *different* backend from the playlist API).
+
+### Secrets — `.env`
+
+Anything that must not be committed goes in `.env` at the repo root (gitignored;
+`.env.example` is the committed template) and is read at configure time by
+`app/build.gradle.kts` into a `buildConfigField`. Same idea as the pre-existing
+`keystore.properties`. A missing file or key resolves to `""` and only logs a Gradle
+warning, so a fresh clone still builds — the *feature* degrades, the build doesn't
+break. Today the only entry is `GEOLOCATION_API_KEY`.
+
+**A key in `.env` still ships inside the APK.** `BuildConfig` strings are trivially
+recoverable from a built APK, so `.env` protects against leaking into git history,
+not against extraction from a device. Restrict such keys server-side — for
+`GEOLOCATION_API_KEY`, lock it to the Geolocation API with a daily quota cap in Google
+Cloud Console. Android package/signature restrictions do **not** apply here: this is a
+plain REST call, not the Maps SDK.
+
+## Device metrics
+
+`MetricsReporter` (app-scoped `@Singleton`, own scope, idempotent `start()` from
+`App.onCreate`) POSTs a device-health payload to `METRICS_BASE_URL` + `send2` **every
+5 minutes**, and is the Android port of the Raspberry-Pi fleet's
+`metrics-sender/upload_stats.py`. The payload keys mirror the Pi's byte-for-byte —
+including the lone snake_case `location_timestamp` and the values the Pi formats as
+`"{:.2f}"` **strings** rather than numbers — so both fleets land in one dashboard with
+no backend change. Keep it that way when touching `DeviceMetricsDto`.
+
+An in-app loop, **not** a `WorkManager` worker: WorkManager's periodic floor is 15 min
+and can't hit the 5-min cadence, and this is a kiosk app that is always foreground.
+Fire-and-forget — a failed POST is logged and retried on the next tick (like the Pi's
+`try/except`), and nothing here touches UI state, so playback is never affected. Each
+tick first waits up to 60 s for validated internet, so a cold boot's ~17 s association
+delay doesn't cost the first datapoint.
+
+**Every metric is nullable and read defensively.** Signage ROMs differ in what they
+expose, so an unreadable source degrades to `null` — never a fabricated `0`, which
+would be indistinguishable from a real reading on the dashboard. Notes from the boxes:
+
+- `cpuTemp` — sysfs `/sys/class/thermal/thermal_zone*/temp`, falling back to
+  `HardwarePropertiesManager` (API 24+, device-owner only — the app is one). Kernels
+  report milli-°C, but some BSPs report °C already (a TX-class box at API 24 reports
+  `81`), hence the `raw > 1000` divide plus a 1–150 °C plausibility filter.
+- `memAvail` is **free disk MB**, not memory — the Pi's confusing name, kept for
+  compatibility. `uptime` is in **hours**.
+- `cpuUsagePercent` — two `/proc/stat` samples 1 s apart. Readable on our boxes;
+  restricted on some hardened ROMs → `null`.
+- `wifiSignalStrength` is already dBm from `WifiManager` — no %→dBm conversion, unlike
+  the Pi's `nmcli` path.
+- `ipAddress` enumerates `NetworkInterface` (works on every API level we support)
+  rather than `ConnectivityManager.activeNetwork` (API 23+).
+
+**Location is boot-only**, matching the Pi's one-shot `geolocation.service` (a port of
+`geolocation.py`): `GeoLocationRepository.resolveOnBoot()` runs **once per process**,
+guarded by an `AtomicBoolean` that is set regardless of outcome, and the fix is cached
+in DataStore forever after. A box that fails every attempt keeps reporting the previous
+boot's coordinates (or nulls) and does not retry until it reboots — the same "recovery
+is a reboot" contract as WiFi provisioning. This bounds Google Geolocation spend at **≤3
+calls per boot** (normally 1); an earlier 24-h-TTL design that re-checked each tick
+would have burned ~3 calls every 5 min on any box Google can't locate. Retry ladder is
+the Pi's: 3 attempts, 10 s → 20 s → 40 s.
+
+Key invariants:
+- **Trilateration needs per-BSSID data** — `ScannedNetwork` collapses an SSID with
+  several APs into one entry, so `WifiScanner.scanAccessPoints()` exists alongside
+  `scan()` and returns one `ScannedAccessPoint` per BSSID (Google needs ≥2 with
+  `considerIp = false`).
+- **The resolve waits for validated internet before scanning** — which implies the setup
+  hotspot is already down, so it can never fight `WifiProvisioningCoordinator` for a
+  single-radio box's antenna. Don't move the scan earlier.
+- **The 5-min tick never spends a Google call** — it reads the cached fix only.
 
 ## WiFi provisioning
 
