@@ -122,16 +122,24 @@ com.cyma.videoloop/
 
 ### API base URL
 
-Defined per build type in `app/build.gradle.kts` as `buildConfigField("String", "API_BASE_URL", ...)`. Change both `debug` and `release` when pointing at a new backend. Same for `METRICS_BASE_URL` (the metrics host is a *different* backend from the playlist API).
+Defined per build type in `app/build.gradle.kts` as `buildConfigField("String", "API_BASE_URL", ...)`. Change both `debug` and `release` when pointing at a new backend. `METRICS_BASE_URL` works the same way (the metrics host is a *different* backend from the playlist API) but its committed default can be overridden from `.env` — see below.
 
-### Secrets — `.env`
+### Secrets and overrides — `.env`
 
-Anything that must not be committed goes in `.env` at the repo root (gitignored;
-`.env.example` is the committed template) and is read at configure time by
-`app/build.gradle.kts` into a `buildConfigField`. Same idea as the pre-existing
-`keystore.properties`. A missing file or key resolves to `""` and only logs a Gradle
-warning, so a fresh clone still builds — the *feature* degrades, the build doesn't
-break. Today the only entry is `GEOLOCATION_API_KEY`.
+`.env` at the repo root (gitignored; `.env.example` is the committed template) is read
+at configure time by `app/build.gradle.kts` into `buildConfigField`s, the same idea as
+the pre-existing `keystore.properties`. Two distinct uses, don't conflate them:
+
+- **Secrets** — must not be committed, so there is no default. `GEOLOCATION_API_KEY`.
+  Absent → `""`, a Gradle warning, and the dependent feature degrades (metrics still
+  report, with null coordinates). A fresh clone still builds.
+- **Overrides** — not secret, so the *production value stays committed* and `.env` only
+  overrides it, e.g. `METRICS_BASE_URL` for a staging host:
+  `secret("METRICS_BASE_URL").ifEmpty { "https://metrics.cyma.digital/" }`. Clone-and-build
+  keeps working; nobody needs a secret injected into CI to get a functioning APK.
+
+Don't move a plain URL into the secret category — it buys no security (see below) and
+breaks fresh clones.
 
 **A key in `.env` still ships inside the APK.** `BuildConfig` strings are trivially
 recoverable from a built APK, so `.env` protects against leaking into git history,

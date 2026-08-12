@@ -30,6 +30,10 @@ if (geolocationApiKey.isEmpty()) {
     logger.warn("WARNING: GEOLOCATION_API_KEY missing from .env — device metrics will report null coordinates.")
 }
 
+// Not a secret — the committed default is the production host, so a fresh clone
+// builds a working APK. `.env` only overrides it (e.g. to point at a staging host).
+val metricsBaseUrl = secret("METRICS_BASE_URL").ifEmpty { "https://metrics.cyma.digital/" }
+
 android {
     namespace = "com.cyma.videoloop"
     compileSdk = 34
@@ -62,7 +66,7 @@ android {
             isMinifyEnabled = false
             isShrinkResources = false
             buildConfigField("String", "API_BASE_URL", "\"https://www.cymadisplay.com/api/v2/\"")
-            buildConfigField("String", "METRICS_BASE_URL", "\"https://metrics.cyma.digital/\"")
+            buildConfigField("String", "METRICS_BASE_URL", "\"$metricsBaseUrl\"")
             buildConfigField("String", "GEOLOCATION_API_KEY", "\"$geolocationApiKey\"")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -75,7 +79,7 @@ android {
             // Signed only when keystore.properties is present; otherwise unsigned.
             signingConfig = if (keystorePropsFile.exists()) signingConfigs.getByName("release") else null
             buildConfigField("String", "API_BASE_URL", "\"https://www.cymadisplay.com/api/v2/\"")
-            buildConfigField("String", "METRICS_BASE_URL", "\"https://metrics.cyma.digital/\"")
+            buildConfigField("String", "METRICS_BASE_URL", "\"$metricsBaseUrl\"")
             buildConfigField("String", "GEOLOCATION_API_KEY", "\"$geolocationApiKey\"")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
