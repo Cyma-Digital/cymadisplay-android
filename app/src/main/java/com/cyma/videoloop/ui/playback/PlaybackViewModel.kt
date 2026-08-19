@@ -112,7 +112,7 @@ class PlaybackViewModel @Inject constructor(
             }
         }
         _uiState.value = if (resolved.isNotEmpty()) PlaybackUiState.Ready(resolved)
-                         else PlaybackUiState.Error("No playable items")
+                         else PlaybackUiState.Error("Nenhum item reproduzível")
     }
 
     fun onPlaybackError(resolvedItem: ResolvedItem) {
@@ -123,7 +123,7 @@ class PlaybackViewModel @Inject constructor(
         if (currentState is PlaybackUiState.Ready) {
             val updated = currentState.items.filter { it.id != resolvedItem.id }
             _uiState.value = if (updated.isNotEmpty()) PlaybackUiState.Ready(updated)
-                             else PlaybackUiState.Error("All media items failed")
+                             else PlaybackUiState.Error("Falha em todas as mídias")
         }
     }
 

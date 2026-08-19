@@ -45,10 +45,10 @@ private fun WaitingForContentScreen() {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Text("Waiting for content", style = MaterialTheme.typography.headlineMedium)
+        Text("Aguardando conteúdo", style = MaterialTheme.typography.headlineMedium)
         Spacer(Modifier.height(16.dp))
         Text(
-            "This display is paired and ready. Add content in the Cyma admin panel.",
+            "Adicione conteúdo no painel administrativo do Cyma Display.",
             style = MaterialTheme.typography.bodyMedium,
         )
         Spacer(Modifier.height(32.dp))
@@ -71,9 +71,9 @@ private fun DownloadDialog(progress: Int, itemIndex: Int, total: Int) {
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 CircularProgressIndicator(progress = progress / 100f)
-                Text("Preparing media…", modifier = Modifier.padding(top = 16.dp))
+                Text("Preparando mídia…", modifier = Modifier.padding(top = 16.dp))
                 if (total > 1) {
-                    Text("Item ${itemIndex + 1} of $total", modifier = Modifier.padding(top = 4.dp))
+                    Text("Item ${itemIndex + 1} de $total", modifier = Modifier.padding(top = 4.dp))
                 }
                 Text("$progress%", modifier = Modifier.padding(top = 8.dp))
             }

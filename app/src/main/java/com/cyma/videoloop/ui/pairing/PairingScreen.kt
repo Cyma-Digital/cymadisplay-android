@@ -40,11 +40,11 @@ fun PairingScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Text("Pair this display", style = MaterialTheme.typography.headlineMedium)
+        Text("Parear este display", style = MaterialTheme.typography.headlineMedium)
 
         Spacer(Modifier.height(32.dp))
 
-        Text("Device ID", style = MaterialTheme.typography.labelMedium)
+        Text("ID do dispositivo", style = MaterialTheme.typography.labelMedium)
         Text(
             uiState.deviceId,
             fontFamily = FontFamily.Monospace,
@@ -54,7 +54,7 @@ fun PairingScreen(
 
         Spacer(Modifier.height(24.dp))
 
-        Text("Pairing Code", style = MaterialTheme.typography.labelMedium)
+        Text("Código de pareamento", style = MaterialTheme.typography.labelMedium)
         Text(
             uiState.pairingCode,
             fontFamily = FontFamily.Monospace,
@@ -75,24 +75,24 @@ fun PairingScreen(
                 ) {
                     CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                     Text(
-                        "Waiting for pairing…",
+                        "Aguardando pareamento…",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
             }
 
             PairingStatus.Paired -> {
-                Text("Paired!", style = MaterialTheme.typography.bodyLarge)
+                Text("Pareado!", style = MaterialTheme.typography.bodyLarge)
             }
 
             PairingStatus.TimedOut -> {
                 Text(
-                    "Timed out after 5 minutes.",
+                    "Tempo esgotado após 5 minutos.",
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Spacer(Modifier.height(16.dp))
-                Button(onClick = { viewModel.retryPolling() }) { Text("Try again") }
+                Button(onClick = { viewModel.retryPolling() }) { Text("Tentar novamente") }
             }
 
             PairingStatus.Error -> {
@@ -100,14 +100,14 @@ fun PairingScreen(
                     Text(it, color = MaterialTheme.colorScheme.error)
                 }
                 Spacer(Modifier.height(16.dp))
-                Button(onClick = { viewModel.retryPolling() }) { Text("Retry") }
+                Button(onClick = { viewModel.retryPolling() }) { Text("Tentar novamente") }
             }
         }
 
         Spacer(Modifier.height(24.dp))
 
         Text(
-            "Enter this code in the Cyma admin panel to activate this display.",
+            "Informe este código no painel administrativo do Cyma Display para ativar este display.",
             style = MaterialTheme.typography.bodySmall,
         )
     }

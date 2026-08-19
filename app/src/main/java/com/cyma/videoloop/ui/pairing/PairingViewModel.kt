@@ -80,7 +80,7 @@ class PairingViewModel @Inject constructor(
                 val detail = lastError?.let { "${it::class.java.simpleName}: ${it.message}" } ?: "unknown"
                 _uiState.value = _uiState.value.copy(
                     status = PairingStatus.Error,
-                    errorMessage = "Failed to register pairing code.\n$detail",
+                    errorMessage = "Falha ao registrar o código de pareamento.\n$detail",
                 )
                 return@launch
             }
