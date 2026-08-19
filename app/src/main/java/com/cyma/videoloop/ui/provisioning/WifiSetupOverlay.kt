@@ -17,6 +17,16 @@ import androidx.compose.ui.unit.dp
 import com.cyma.videoloop.wifi.ProvisioningState
 
 /**
+ * Master switch for the on-screen WiFi-setup overlay. Off deliberately: the cards
+ * publish the hotspot SSID/password and the portal QR to anyone standing in front
+ * of the panel. Provisioning itself is untouched — [com.cyma.videoloop.wifi.WifiProvisioningCoordinator]
+ * still raises the hotspot + captive portal on an offline boot; only the display is
+ * silent, so a tech must know the credentials out of band. Flip to true to bring
+ * the cards back.
+ */
+const val SHOW_WIFI_SETUP_UI = false
+
+/**
  * Non-blocking overlay for background WiFi provisioning. Rendered on top of the
  * always-running content (playback/pairing) — it occupies only a corner of the screen,
  * so video keeps playing behind it. Renders nothing when [state] is
@@ -38,6 +48,10 @@ fun WifiSetupOverlay(
         LaunchedEffect(state) { launcher.launch(state.permissions.toTypedArray()) }
         return
     }
+
+    // After the NeedsPermission branch on purpose: that branch draws nothing, it only
+    // launches the runtime-permission request non-device-owner boxes still need.
+    if (!SHOW_WIFI_SETUP_UI) return
 
     Box(modifier = modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.BottomStart) {
         when (state) {
