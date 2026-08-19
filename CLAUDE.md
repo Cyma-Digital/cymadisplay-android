@@ -104,13 +104,37 @@ com.cyma.videoloop/
 4. For each `PlaylistItem`, `MediaCacheRepository.materialize()` emits `Downloading(progress)` while downloading, then `Ready(file)` — skips download if file already exists on disk.
 5. On download error, the VM falls back to streaming the remote URL directly so playback is never blocked.
 6. Once all items are resolved, `PlaybackUiState.Ready(items)` is emitted to `PlaybackScreen`.
-7. `PlaybackEngine` walks the list: videos use a single `ExoPlayer` instance per slot; images use Coil + a `delay()` timer. `REPEAT_MODE_ONE` is set when the playlist has exactly one video item.
+7. `PlaybackEngine` walks the list: one engine-owned `ExoPlayer` plays every video item; images use Coil + a `delay()` timer. `REPEAT_MODE_ONE` is set when the playlist has exactly one video item.
 
 ### Key invariants
 
 - **Queue swap happens between items**, never mid-item. When the schedule updates, `collectLatest` in the ViewModel cancels the in-progress `loadSchedule` call and re-runs — but the engine only advances to the next item on a natural boundary.
 - **Never block on network** — if media isn't cached and the download fails, fall back to streaming so the screen is never blank.
-- **One ExoPlayer per `VideoSlot`** — released in `DisposableEffect`. Don't rebuild it on recomposition; key it on `item.uri`.
+- **One ExoPlayer for the whole `PlaybackEngine`, never one per `VideoSlot`.**
+  `PlaybackEngine` builds it (via `buildVideoOnlyPlayer`) and is the only place
+  that may `release()` it; `VideoSlot` binds a listener + media item and calls
+  `stop()` on dispose. It used to be per-slot, and on a 1 video + 1 image
+  playlist (a 28 s loop) that create/release churn tore down the OMX component,
+  unloaded/reloaded the codec `.so`, redid 15+ ion allocations of 3.1 MB, and
+  dumped ~15 MB of large-object garbage per cycle → recurring 100–490 ms GC
+  pauses, plus a `Handler on a dead thread` warning from the frame callback
+  racing the released player. Measured on an Allwinner H3: hoisting it took the
+  app from 118.9% to 37.6% of a core averaged over the loop. `VideoSlot` also
+  owns the `Surface` it wraps around the `TextureView`'s `SurfaceTexture` and
+  **must release it** in `onSurfaceTextureDestroyed` — with a persistent player
+  nothing else will.
+- **No audio renderers — `buildVideoOnlyPlayer` overrides
+  `DefaultRenderersFactory.buildAudioRenderers` to add nothing.** On these
+  Allwinner boxes the framework's `AudioTrackThread` spins in userspace instead
+  of sleeping: `simpleperf` put it at ~96% of one core for the whole duration of
+  every video (63% of the app's total CPU), all inside
+  `AudioTrack::processAudioBuffer`, burnt on `clock_gettime`/`systemTime` and on
+  64-bit divides ARM32 emulates in software (`__divdi3` alone 16% of the thread);
+  it sampled as state `R` in 20/20 samples. Muting or zeroing the volume does
+  **not** help — a muted `AudioTrack` runs the same loop; only having no audio
+  renderer avoids creating one. Playback is video-only by product decision. If a
+  schedule ever needs sound, re-measure: the content is 48 kHz AAC while the HAL
+  runs at 44.1 kHz, but matching the rate is **not** proven to stop the spin.
 - **Cache key = `sha256(sourceUrl)`** — changing a video's URL produces a new cache entry; the old one is cleaned up by `evictOrphans` after the next schedule sync.
 
 ### Adding a new feature

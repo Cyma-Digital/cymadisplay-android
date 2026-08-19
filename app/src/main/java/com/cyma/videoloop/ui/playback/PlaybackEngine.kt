@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.SurfaceTexture
 import android.os.Build
+import android.os.Handler
 import android.util.Log
 import android.view.Surface
 import android.view.SurfaceView
@@ -41,6 +42,10 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.Renderer
+import androidx.media3.exoplayer.audio.AudioRendererEventListener
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import androidx.webkit.WebViewAssetLoader
@@ -70,33 +75,114 @@ fun PlaybackEngine(
         if (!isOnly) currentIndex = (currentIndex + 1) % items.size
     }
 
+    // ONE ExoPlayer for the whole engine lifetime — deliberately NOT one per
+    // VideoSlot. A create/release per item is ruinous on the signage boxes:
+    // measured on an Allwinner H3 with a 1 video + 1 image playlist (a 28 s
+    // loop), each turn tore down the OMX component, unloaded and reloaded the
+    // codec .so, re-ran 15+ ion allocations of 3.1 MB, and dumped ~15 MB of
+    // large-object garbage (the DefaultAllocator's 64 KB chunks) — which bought
+    // recurring GC pauses of 100-490 ms. It also raced the frame callback into a
+    // released player, logging "sending message to a Handler on a dead thread"
+    // on every switch.
+    //
+    // Kept null when the playlist has no video at all, so an image/template-only
+    // schedule doesn't hold a decoder open for nothing.
+    val context = LocalContext.current
+    val needsPlayer = items.any { it is ResolvedItem.Video }
+    val exoPlayer = remember(needsPlayer) {
+        if (needsPlayer) {
+            Log.d(TAG, "Creating ExoPlayer")
+            buildVideoOnlyPlayer(context)
+        } else {
+            null
+        }
+    }
+    DisposableEffect(exoPlayer) {
+        onDispose {
+            exoPlayer?.let {
+                Log.d(TAG, "Releasing ExoPlayer")
+                it.release()
+            }
+        }
+    }
+
     Box(modifier = modifier.fillMaxSize()) {
         when (val item = current) {
-            is ResolvedItem.Video -> VideoSlot(item, isOnly = isOnly, onEnded = advance, onPlaybackError = onPlaybackError)
+            is ResolvedItem.Video ->
+                if (exoPlayer != null) {
+                    VideoSlot(
+                        exoPlayer = exoPlayer,
+                        item = item,
+                        isOnly = isOnly,
+                        onEnded = advance,
+                        onPlaybackError = onPlaybackError,
+                    )
+                } else {
+                    // Unreachable: needsPlayer is derived from this same list. Skip
+                    // rather than stall the queue if that ever stops holding.
+                    LaunchedEffect(item.id) { advance() }
+                }
             is ResolvedItem.Image -> ImageSlot(item, isOnly = isOnly, onElapsed = advance)
             is ResolvedItem.Template -> key(item.templateId) { TemplateSlot(item, isOnly = isOnly, onElapsed = advance) }
         }
     }
 }
 
+/**
+ * Builds an [ExoPlayer] with **no audio renderers at all**, so no `AudioTrack` is
+ * ever created.
+ *
+ * On the Allwinner signage boxes the framework's `AudioTrackThread` spins in
+ * userspace instead of sleeping. Profiled with `simpleperf` on an H3 (Android
+ * 7.0, API 24) it held ~96% of one core for the entire duration of every video —
+ * 63% of the app's total CPU — all of it inside
+ * `AudioTrack::AudioTrackThread::threadLoop` → `AudioTrack::processAudioBuffer`,
+ * burnt on `clock_gettime`/`systemTime` and on 64-bit divisions that ARM32
+ * emulates in software (`__divdi3` alone was 16% of the thread). The thread
+ * sampled as state R in 20 of 20 samples: it was never waiting on the audio
+ * pipeline, just looping. The content also carries 48 kHz AAC while the HAL runs
+ * at 44.1 kHz, so the rate never matched to begin with.
+ *
+ * Dropping the audio renderers is the fix rather than muting or zeroing volume:
+ * a muted `AudioTrack` still runs the same loop. Signage playback here is
+ * video-only by product decision — revisit this if a schedule ever needs sound,
+ * and re-measure, because matching the HAL's rate is not proven to stop the spin.
+ */
+private fun buildVideoOnlyPlayer(context: Context): ExoPlayer {
+    val renderersFactory = object : DefaultRenderersFactory(context) {
+        override fun buildAudioRenderers(
+            context: Context,
+            extensionRendererMode: Int,
+            mediaCodecSelector: MediaCodecSelector,
+            enableDecoderFallback: Boolean,
+            audioSink: AudioSink,
+            eventHandler: Handler,
+            eventListener: AudioRendererEventListener,
+            out: ArrayList<Renderer>,
+        ) {
+            // Intentionally empty — see kdoc. Adding nothing to `out` means the
+            // player has no audio renderer to enable.
+        }
+    }.setEnableDecoderFallback(true)
+    return ExoPlayer.Builder(context).setRenderersFactory(renderersFactory).build()
+}
+
+/**
+ * Plays [item] on the engine-owned [exoPlayer]. The player outlives this slot by
+ * design — see the comment in [PlaybackEngine] — so this composable only binds a
+ * listener and a media item, and must never release it.
+ */
 @Composable
 private fun VideoSlot(
+    exoPlayer: ExoPlayer,
     item: ResolvedItem.Video,
     isOnly: Boolean,
     onEnded: () -> Unit,
     onPlaybackError: (ResolvedItem) -> Unit,
 ) {
-    val context = LocalContext.current
     val currentOnEnded by rememberUpdatedState(onEnded)
     val currentOnError by rememberUpdatedState(onPlaybackError)
     val currentIsOnly by rememberUpdatedState(isOnly)
-
-    val exoPlayer = remember {
-        Log.d(TAG, "Creating ExoPlayer")
-        ExoPlayer.Builder(context)
-            .setRenderersFactory(DefaultRenderersFactory(context).setEnableDecoderFallback(true))
-            .build()
-    }
 
     DisposableEffect(exoPlayer) {
         val listener = object : Player.Listener {
@@ -136,14 +222,10 @@ private fun VideoSlot(
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
         onDispose {
+            // Stop, never release: the engine owns this player's lifetime. Stopping
+            // frees the codec and the loader's buffers while the next item (image or
+            // template) is on screen.
             exoPlayer.stop()
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            Log.d(TAG, "Releasing ExoPlayer")
-            exoPlayer.release()
         }
     }
 
@@ -151,12 +233,19 @@ private fun VideoSlot(
         factory = { ctx ->
             TextureView(ctx).apply {
                 surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                    // Held so it can be released on teardown. The player no longer
+                    // dies between items, so an unreleased Surface per video would
+                    // now leak once per loop instead of going away with the player.
+                    private var videoSurface: Surface? = null
+
                     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-                        exoPlayer.setVideoSurface(Surface(surface))
+                        videoSurface = Surface(surface).also(exoPlayer::setVideoSurface)
                     }
                     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
                     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                         exoPlayer.clearVideoSurface()
+                        videoSurface?.release()
+                        videoSurface = null
                         return true
                     }
                     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
