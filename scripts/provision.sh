@@ -71,11 +71,14 @@ STAGE_NAMES=(
   "preflight            host tools, device, artefacts"
   "install-app          signage APK (must precede device-owner)"
   "device-owner         claim DO + WRITE_SETTINGS appop"
+  "permissions          overlay + location for the signage app"
   "install-extras       FLauncher, AnyDesk, AdControl"
   "network-gate         require validated internet  <-- manual step"
   "launcher             back up OEM launcher, make FLauncher HOME"
   "wallpaper            install the FLauncher wallpaper"
+  "flauncher-clean      strip FLauncher's app categories"
   "google-stack         disable Play Store / Services / YouTube"
+  "anydesk-id           report the box's AnyDesk ID"
   "acceptance           final assertions"
 )
 
@@ -166,8 +169,8 @@ while (( $# )); do
   esac
 done
 
-[[ "$FROM_STAGE" =~ ^[1-9]$ ]] || die "--from takes a stage number 1-9 (see --list)"
-[[ "$ONLY_STAGE" =~ ^[0-9]$ ]]  || die "--only takes a stage number 1-9 (see --list)"
+[[ "$FROM_STAGE" =~ ^([1-9]|1[0-2])$ ]] || die "--from takes a stage number 1-12 (see --list)"
+[[ "$ONLY_STAGE" =~ ^([0-9]|1[0-2])$ ]] || die "--only takes a stage number 1-12 (see --list)"
 
 # --only runs exactly one stage, for testing a single step against a box without
 # letting the destructive ones (stage 6 uninstalls the OEM launcher) follow on.
@@ -268,10 +271,50 @@ if run_stage 3; then
   ok "device owner verified"
 fi
 
-# ===================================================== 4. install extras =====
+# ======================================================== 4. permissions =====
 
 if run_stage 4; then
   banner 4
+
+  # Draw-over-other-apps. This is an APPOP, not a runtime permission, so the
+  # device-owner self-grant in DeviceOwnerManager cannot reach it and neither
+  # can `pm grant` — only `appops set`. API 24 tends to default it to allow for
+  # a sideloaded app, which is exactly why it must be asserted rather than
+  # assumed: on 26+ the same install lands on 'default' and the overlay silently
+  # never shows.
+  adbx shell appops set "$PKG_APP" SYSTEM_ALERT_WINDOW allow >/dev/null 2>&1 || true
+  got="$(sh_out appops get "$PKG_APP" SYSTEM_ALERT_WINDOW || true)"
+  [[ "$got" == *allow* ]] || fail "SYSTEM_ALERT_WINDOW reads '${got:-unset}', expected allow"
+  ok "overlay (draw over other apps) allowed"
+
+  # Location. The app self-grants ACCESS_FINE_LOCATION as device owner, which
+  # lands the grant POLICY_FIXED — and a POLICY_FIXED grant refuses `pm grant`.
+  # So check first and only grant when it is actually missing, or a healthy box
+  # fails here for having done the right thing already.
+  for perm in ACCESS_FINE_LOCATION ACCESS_COARSE_LOCATION; do
+    if sh_has "android.permission.$perm: granted=true" dumpsys package "$PKG_APP"; then
+      ok "$perm granted"
+    else
+      adbx shell pm grant "$PKG_APP" "android.permission.$perm" >/dev/null 2>&1 || true
+      sh_has "android.permission.$perm: granted=true" dumpsys package "$PKG_APP" \
+        || fail "$perm is not granted and pm grant did not take"
+      ok "$perm granted (by pm grant)"
+    fi
+  done
+
+  # WiFi scanning for trilateration and the hotspot APIs both need location
+  # services switched on at the system level, which is separate from the app's
+  # permission. Without it the scan returns an empty list and metrics report
+  # null coordinates.
+  loc="$(sh_out settings get secure location_providers_allowed || true)"
+  [[ -n "$loc" ]] && ok "location providers: $loc" \
+    || warn "no location providers enabled — WiFi trilateration will report null coordinates"
+fi
+
+# ===================================================== 5. install extras =====
+
+if run_stage 5; then
+  banner 5
   adbx install -r "$APK_FLAUNCHER" >/dev/null || fail "FLauncher install failed"
   pkg_installed "$PKG_FLAUNCHER" || fail "$PKG_FLAUNCHER missing after install"
   ok "FLauncher installed"
@@ -304,8 +347,8 @@ fi
 
 # ======================================================= 5. network gate =====
 
-if run_stage 5; then
-  banner 5
+if run_stage 6; then
+  banner 6
   # "metrics posted" is the only proof that means the internet, not merely an
   # association with an AP. Give the app a moment first: MetricsReporter waits
   # up to 60 s for validated internet on each tick, and a cold boot's WiFi
@@ -344,7 +387,7 @@ if run_stage 5; then
 
   Then resume — earlier stages are idempotent, so this is safe either way:
 
-      scripts/provision.sh --serial $SERIAL --from 5
+      scripts/provision.sh --serial $SERIAL --from 6
 
 EOF
     exit 10
@@ -353,8 +396,8 @@ fi
 
 # =========================================================== 6. launcher =====
 
-if run_stage 6; then
-  banner 6
+if run_stage 7; then
+  banner 7
   home_now="$(sh_out cmd package resolve-activity -c android.intent.category.HOME \
               -a android.intent.action.MAIN | grep -m1 packageName | cut -d= -f2)"
   info "HOME currently resolves to ${home_now:-<unknown>}"
@@ -415,8 +458,8 @@ fi
 
 # ========================================================== 7. wallpaper =====
 
-if run_stage 7; then
-  banner 7
+if run_stage 8; then
+  banner 8
   if [[ "${HAVE_ROOT:-0}" != "1" ]]; then
     skip "no root — set the wallpaper from FLauncher's Settings > Wallpaper (runbook §4.1 path B)"
   else
@@ -428,7 +471,7 @@ if run_stage 7; then
 
     adbx push "$WALLPAPER" /sdcard/wallpaper.png >/dev/null || fail "push of $WALLPAPER failed"
 
-    su_script <<EOS
+    su_script >/dev/null 2>&1 <<EOS
 set -e
 P=/data/data/$PKG_FLAUNCHER
 U=\$(stat -c %u:%g \$P)
@@ -462,10 +505,49 @@ EOS
   fi
 fi
 
-# ======================================================= 8. google stack =====
+# =================================================== 9. flauncher-clean ======
 
-if run_stage 8; then
-  banner 8
+if run_stage 9; then
+  banner 9
+  if [[ "${HAVE_ROOT:-0}" != "1" ]]; then
+    skip "no root — remove the categories by hand in FLauncher's Settings"
+  else
+    DB=/data/data/$PKG_FLAUNCHER/app_flutter/db.sqlite
+    # FLauncher keeps its home-screen sections in a sqlite table; the box does
+    # not need an app browser, so both go. apps_categories is ON DELETE CASCADE,
+    # so the membership rows follow and the apps table is untouched — the app
+    # list is rebuilt from PackageManager on every start, and Settings >
+    # Applications can put them back.
+    # Force-stop first: FLauncher holds the DB open in WAL mode and would write
+    # its in-memory copy back over the delete on exit.
+    adbx shell am force-stop "$PKG_FLAUNCHER" >/dev/null 2>&1 || true
+    sleep 2
+
+    if (( DRY_RUN )); then
+      info "would delete all rows from the categories table"
+    else
+      # wal_checkpoint returns a result row and restorecon chatters about
+      # file_contexts; neither is a result, so neither belongs in the output.
+      su_script >/dev/null 2>&1 <<EOS
+set -e
+U=\$(stat -c %u:%g /data/data/$PKG_FLAUNCHER)
+sqlite3 $DB "PRAGMA foreign_keys=ON; DELETE FROM categories; PRAGMA wal_checkpoint(TRUNCATE);"
+chown \$U $DB 2>/dev/null || true
+chown \$U ${DB}-wal ${DB}-shm 2>/dev/null || true
+restorecon -R /data/data/$PKG_FLAUNCHER/app_flutter
+EOS
+      left="$(printf 'sqlite3 %s "select count(*) from categories;"\n' "$DB" | su_script | tr -d '\r' | tail -1)"
+      [[ "$left" == "0" ]] || fail "categories table still holds '${left:-?}' rows"
+      ok "FLauncher categories removed"
+      info "home screen now shows no apps — reach AnyDesk with 'adb shell monkey -p $PKG_ANYDESK -c android.intent.category.LAUNCHER 1'"
+    fi
+  fi
+fi
+
+# ====================================================== 10. google stack =====
+
+if run_stage 10; then
+  banner 10
   for p in "${GOOGLE_PKGS[@]}"; do
     if ! pkg_installed "$p"; then info "$p not present on this ROM"; continue; fi
     if sh_hasx "package:$p" pm list packages -d; then skip "$p already disabled"; continue; fi
@@ -476,10 +558,46 @@ if run_stage 8; then
   info "Play Store noise in logcat right after installs is post-install checks, not a crash loop"
 fi
 
-# ========================================================= 9. acceptance =====
+# =========================================================== 11. anydesk =====
 
-if run_stage 9; then
-  banner 9
+if run_stage 11; then
+  banner 11
+  # AnyDesk generates its ID on first start without any on-screen interaction —
+  # it only needs the internet, which stage 6 has already proven. It writes the
+  # ID to system.conf under device-protected storage (/data/user_de), NOT the
+  # usual /data/data path, because MainApplication opts into DPS at startup.
+  adbx shell monkey -p "$PKG_ANYDESK" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+
+  if [[ "${HAVE_ROOT:-0}" != "1" ]]; then
+    skip "no root — read the AnyDesk ID off the box's screen"
+  else
+    CONF=/data/user_de/0/$PKG_ANYDESK/files/.anydesk/system.conf
+    ANYDESK_ID=""
+    for _ in $(seq 1 10); do
+      # grep only the id key. system.conf also holds this client's private key;
+      # never cat the whole file into a log or a terminal.
+      ANYDESK_ID="$(printf 'grep -o "ad.anynet.id=[0-9]*" %s 2>/dev/null | cut -d= -f2\n' "$CONF" \
+                    | su_script | tr -d '\r' | tr -dc '0-9')"
+      [[ -n "$ANYDESK_ID" ]] && break
+      sleep 3
+    done
+    if [[ -n "$ANYDESK_ID" ]]; then
+      ok "AnyDesk ID: $ANYDESK_ID"
+      echo "$ANYDESK_ID" > "provisioning/backups/anydesk-id-${SERIAL}.txt" 2>/dev/null || true
+      info "recorded in provisioning/backups/anydesk-id-${SERIAL}.txt — put it in the fleet inventory"
+    else
+      warn "AnyDesk has not generated an ID yet — check again once it has been online a minute"
+    fi
+  fi
+
+  warn "still manual (runbook §2.4): enable the AdControl plugin inside AnyDesk's
+        settings, and set an unattended-access password. Needs a remote or mouse."
+fi
+
+# ======================================================== 12. acceptance =====
+
+if run_stage 12; then
+  banner 12
   rc=0
 
   pid="$(sh_out pidof "$PKG_APP" | tr ' ' '\n' | head -1)"
@@ -490,6 +608,12 @@ if run_stage 9; then
 
   sh_has "Device Owner" dumpsys device_policy \
     && ok "device owner claimed" || { warn "device owner NOT claimed"; rc=1; }
+
+  [[ "$(sh_out appops get "$PKG_APP" SYSTEM_ALERT_WINDOW || true)" == *allow* ]] \
+    && ok "overlay permission allowed" || { warn "overlay permission NOT allowed"; rc=1; }
+
+  sh_has "android.permission.ACCESS_FINE_LOCATION: granted=true" dumpsys package "$PKG_APP" \
+    && ok "location permission granted" || { warn "ACCESS_FINE_LOCATION NOT granted"; rc=1; }
 
   home_now="$(sh_out cmd package resolve-activity -c android.intent.category.HOME \
               -a android.intent.action.MAIN | grep -m1 packageName | cut -d= -f2)"
@@ -512,6 +636,15 @@ if run_stage 9; then
     if (( c < 80 )); then ok "SoC ${c}°C"
     else warn "SoC ${c}°C — at or near the 85°C trip; fit a fan"; rc=1; fi
   fi
+  if [[ "${HAVE_ROOT:-0}" == "1" ]]; then
+    n="$(printf 'sqlite3 /data/data/%s/app_flutter/db.sqlite "select count(*) from categories;"\n' "$PKG_FLAUNCHER" \
+         | su_script | tr -d '\r' | tail -1)"
+    [[ "$n" == "0" ]] && ok "FLauncher categories stripped" || warn "FLauncher still has ${n:-?} categories"
+    id="$(printf 'grep -o "ad.anynet.id=[0-9]*" /data/user_de/0/%s/files/.anydesk/system.conf 2>/dev/null | cut -d= -f2\n' "$PKG_ANYDESK" \
+         | su_script | tr -d '\r' | tr -dc '0-9')"
+    [[ -n "$id" ]] && ok "AnyDesk ID $id" || warn "no AnyDesk ID yet"
+  fi
+
   online="$(sh_out cat /sys/devices/system/cpu/online || true)"
   [[ "$online" == "0-3" ]] && ok "all cores online (0-3)" || warn "cores online: ${online:-?}"
 

@@ -25,11 +25,12 @@ scripts/provision.sh               # provision the attached box
 
 Stages are idempotent, so re-running is always safe. It stops with **exit 10**
 at §3 (network) and prints what to do by hand, because there is no adb path to
-configure WiFi on API 24; resume with `--from 5`. `--list` shows the stages,
+configure WiFi on API 24; resume with `--from 6`. `--list` shows the stages,
 `--only N` runs one, `--serial` picks a box. Read the rest of this file to
 understand *why* each step is what it is — the script is the runbook executed,
-not a replacement for it. Two things it cannot do at all: AnyDesk's first launch
-(§2.4) and fitting the fan (§0).
+not a replacement for it. It reports the box's AnyDesk ID and records it under
+`provisioning/backups/`. Two things it cannot do at all: enabling the AdControl
+plugin inside AnyDesk's settings (§2.4) and fitting the fan (§0).
 
 ---
 
@@ -142,12 +143,72 @@ If it reports `granted=false`, the plugin has to be pushed to
 `/system/priv-app` on a rooted box — a system-partition change, so decide
 deliberately. ⚠️ not attempted here.
 
-### 2.4 First launch ⚠️
+### 2.4 First launch and the AnyDesk ID ✅
 
-AnyDesk and the plugin install as `notLaunched=true`. AnyDesk needs one manual
-open to generate its ID, and the plugin must be enabled inside AnyDesk's
-settings. This needs a remote or mouse on the box; it cannot be completed over
-`adb` alone. Record the AnyDesk ID in the fleet inventory.
+Start AnyDesk once and read its ID back over adb — **no remote or mouse needed
+for this part**:
+
+```bash
+adb shell monkey -p com.anydesk.anydeskandroid -c android.intent.category.LAUNCHER 1
+sleep 10
+adb shell "su -c 'grep -o \"ad.anynet.id=[0-9]*\" \
+  /data/user_de/0/com.anydesk.anydeskandroid/files/.anydesk/system.conf'"
+```
+
+✅ Confirmed on the reference box: AnyDesk generated ID `1044639324` on its
+first start with no interaction at all. Two details matter.
+
+**The config lives in device-protected storage.** `MainApplication` opts into
+DPS at startup (`using device protected storage` in logcat), so the path is
+`/data/user_de/0/...` and **not** `/data/data/...` — the latter's `files/` dir
+is empty, which reads as "AnyDesk stored nothing" if you look there first.
+
+**`system.conf` also holds this client's private key** (`ad.anynet.pkey`) and
+certificate. Grep the single `ad.anynet.id` key; never `cat` the file into a
+terminal, a log, or a ticket.
+
+Record the ID in the fleet inventory. `scripts/provision.sh` writes it to
+`provisioning/backups/anydesk-id-<serial>.txt` for you.
+
+⚠️ **Still manual:** enabling the AdControl plugin inside AnyDesk's settings,
+and setting an unattended-access password. Those are UI-only and need a remote
+or mouse on the box.
+
+### 2.5 Grant the signage app's permissions ✅
+
+```bash
+# draw over other apps -- an APPOP, so neither the device-owner self-grant
+# nor `pm grant` can set it
+adb shell appops set com.cyma.videoloop SYSTEM_ALERT_WINDOW allow
+
+# location
+adb shell pm grant com.cyma.videoloop android.permission.ACCESS_FINE_LOCATION
+adb shell pm grant com.cyma.videoloop android.permission.ACCESS_COARSE_LOCATION
+
+# verify
+adb shell appops get com.cyma.videoloop SYSTEM_ALERT_WINDOW      # -> allow
+adb shell dumpsys package com.cyma.videoloop | grep -E "LOCATION: granted"
+```
+
+Two traps, both ✅ observed on the reference box:
+
+- **`ACCESS_FINE_LOCATION` is already granted with `flags=[ POLICY_FIXED ]`** —
+  `DeviceOwnerManager` self-grants it, and a POLICY_FIXED grant makes `pm grant`
+  fail. Check before granting, or a correctly-configured box errors for having
+  done the right thing. `ACCESS_COARSE_LOCATION` is *not* in that self-grant
+  list, and did need `pm grant`.
+- **API 24 defaults `SYSTEM_ALERT_WINDOW` to `allow` for a sideloaded app.** So
+  this looks like a no-op here and is not one on API 26+, where the same install
+  lands on `default` and the overlay silently never draws. Assert it, never
+  assume it.
+
+The system location toggle is separate from the app's permission: with no
+provider enabled the WiFi scan returns an empty list and metrics report null
+coordinates.
+
+```bash
+adb shell settings get secure location_providers_allowed    # non-empty
+```
 
 ---
 
@@ -369,6 +430,45 @@ deleted afterwards.
   adb shell am force-stop me.efesser.flauncher
   ```
 
+### 4.2 Strip FLauncher's app categories ✅
+
+FLauncher ships two home-screen sections, `TV Applications` and
+`Non-TV Applications`. A signage box is not browsed, so both go:
+
+```bash
+adb shell am force-stop me.efesser.flauncher      # it holds the DB open in WAL
+adb shell su <<'EOS'
+DB=/data/data/me.efesser.flauncher/app_flutter/db.sqlite
+U=$(stat -c %u:%g /data/data/me.efesser.flauncher)
+sqlite3 $DB "PRAGMA foreign_keys=ON; DELETE FROM categories; PRAGMA wal_checkpoint(TRUNCATE);"
+chown $U $DB; restorecon -R /data/data/me.efesser.flauncher/app_flutter
+EOS
+adb shell am start -n me.efesser.flauncher/me.efesser.flauncher.MainActivity
+```
+
+`sqlite3` is at `/system/xbin/sqlite3` on these boxes, so this needs no host-side
+pull. The schema is `categories` + `apps_categories` + `apps`; the membership
+table is `ON DELETE CASCADE`, so deleting the categories takes the membership
+rows with it and **leaves `apps` untouched** — that table is rebuilt from
+`PackageManager` on every start anyway.
+
+**Force-stop first.** FLauncher keeps the DB open in WAL mode and writes its
+in-memory copy back on exit, silently undoing the delete.
+
+✅ Confirmed: FLauncher starts cleanly with zero categories — no crash, no ANR.
+The home screen renders as wallpaper plus the clock and the settings gear.
+
+**This leaves no apps on the home screen.** That is the point, but it means
+AnyDesk cannot be opened from the panel any more. It is still reachable:
+
+```bash
+adb shell monkey -p com.anydesk.anydeskandroid -c android.intent.category.LAUNCHER 1
+```
+
+and the categories can be rebuilt from FLauncher's own Settings > Applications
+with a remote. AnyDesk's incoming-connection service runs independently of the
+launcher, so remote access is unaffected.
+
 ---
 
 ## 5. Disable the Google stack
@@ -462,6 +562,16 @@ adb shell "for t in /proc/$PID/task/*; do cat \$t/comm; done" | grep -c AudioTra
 adb shell cmd package resolve-activity -c android.intent.category.HOME \
     -a android.intent.action.MAIN | grep packageName
 
+# app permissions
+adb shell appops get com.cyma.videoloop SYSTEM_ALERT_WINDOW          # allow
+adb shell dumpsys package com.cyma.videoloop | grep "LOCATION: granted"
+
+# FLauncher stripped, AnyDesk identified
+adb shell "su -c 'sqlite3 /data/data/me.efesser.flauncher/app_flutter/db.sqlite \
+    \"select count(*) from categories;\"'"                              # 0
+adb shell "su -c 'grep -o \"ad.anynet.id=[0-9]*\" \
+    /data/user_de/0/com.anydesk.anydeskandroid/files/.anydesk/system.conf'"
+
 # google stack off
 adb shell pm list packages -d
 ```
@@ -508,6 +618,8 @@ A 27 Mbps 1080p asset was measured on a sibling box; 5.1 Mbps 1080p on this one.
 | Google stack | `adb shell pm enable <package>` |
 | Launcher | `adb install -r premiumnptvlauncher2-BACKUP.apk` then `set-home-activity` |
 | Wallpaper | `adb shell "su -c 'rm /data/data/me.efesser.flauncher/app_flutter/wallpaper'"` then force-stop |
+| FLauncher categories | rebuild them in FLauncher's Settings > Applications (no backup: they are two rows, recreated by hand) |
+| App permissions | `adb shell appops set com.cyma.videoloop SYSTEM_ALERT_WINDOW default` |
 | AnyDesk / plugin | `adb shell pm uninstall com.anydesk.anydeskandroid` (and `...adcontrol.aosp`) |
 | WiFi setup cards | `SHOW_WIFI_SETUP_UI = true` in `WifiSetupOverlay.kt`, rebuild |
 | Device owner | `adb shell dpm remove-active-admin com.cyma.videoloop/.admin.CymaAdminReceiver` |
