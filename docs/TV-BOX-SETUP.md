@@ -28,10 +28,6 @@ and the launcher preference must be re-set *after* removing the old launcher.
   | `provisioning/apks/flauncher-0.18.0.apk` | `me.efesser.flauncher` | 0.18.0 |
   | `provisioning/assets/wallpaper.png` | — | — |
 
-  ⚠️ `aosp-1.1.0.apk` is **not** in the repo — it was absent from the staging
-  directory the rest of these files came from. Step 2.3 cannot be completed
-  until someone drops it into `provisioning/apks/`. See `provisioning/README.md`.
-
 - The signage APK, built from `main`:
 
   ```bash
