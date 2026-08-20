@@ -73,3 +73,6 @@ fastlane/test_output
 
 # Profiling
 *.trace
+
+# Pulled OEM launcher backups (per-box, made by scripts/provision.sh)
+provisioning/backups/

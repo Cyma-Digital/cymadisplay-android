@@ -12,6 +12,25 @@ so validate them on the first box and correct this file.
 Order matters. Device owner must be claimed before any account touches the box,
 and the launcher preference must be re-set *after* removing the old launcher.
 
+## Run it as a script
+
+`scripts/provision.sh` drives everything below that adb can do, asserting each
+step instead of printing output for a human to judge:
+
+```bash
+./gradlew assembleRelease
+scripts/provision.sh --dry-run     # look first
+scripts/provision.sh               # provision the attached box
+```
+
+Stages are idempotent, so re-running is always safe. It stops with **exit 10**
+at §3 (network) and prints what to do by hand, because there is no adb path to
+configure WiFi on API 24; resume with `--from 5`. `--list` shows the stages,
+`--only N` runs one, `--serial` picks a box. Read the rest of this file to
+understand *why* each step is what it is — the script is the runbook executed,
+not a replacement for it. Two things it cannot do at all: AnyDesk's first launch
+(§2.4) and fitting the fan (§0).
+
 ---
 
 ## 0. Prerequisites
