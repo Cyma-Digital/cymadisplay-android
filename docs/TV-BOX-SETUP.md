@@ -274,18 +274,32 @@ installer. Step 4's item 3 already does that launch.
 ```bash
 adb push provisioning/assets/wallpaper.png /sdcard/wallpaper.png
 
-adb shell su -c '
-  P=/data/data/me.efesser.flauncher
-  U=$(dumpsys package me.efesser.flauncher | grep -m1 userId= | tr -dc 0-9)
-  mkdir -p $P/app_flutter
-  cp /sdcard/wallpaper.png $P/app_flutter/wallpaper
-  chown $U:$U $P/app_flutter $P/app_flutter/wallpaper
-  chmod 600 $P/app_flutter/wallpaper
-  restorecon -R $P/app_flutter
-'
+adb shell su <<'EOS'
+set -e
+P=/data/data/me.efesser.flauncher
+U=$(stat -c %u:%g $P)                  # the dir the installer made; authoritative
+mkdir -p $P/app_flutter
+cp /sdcard/wallpaper.png $P/app_flutter/wallpaper
+chown $U $P/app_flutter $P/app_flutter/wallpaper
+chmod 600 $P/app_flutter/wallpaper
+restorecon -R $P/app_flutter
+EOS
+
 adb shell rm /sdcard/wallpaper.png
 adb shell am force-stop me.efesser.flauncher
 ```
+
+**Feed the script to `su` on stdin, as above — do not write
+`adb shell su -c '…multiple lines…'`.** Your local shell strips the quotes, so
+the box's `sh` receives a bare `su -c` with its argument on the next line: `su`
+prints its usage banner and the rest of the script runs *outside* it. ✅
+Reproduced on the reference box (SuperSU 2.82) — `su` dumped usage, `U` came
+back empty, and a `chown` with an empty variable would have followed. `adb shell
+"su -c '…'"` (quotes nested so the remote shell gets one argument) also works if
+you prefer a one-liner. Do not derive the uid by grepping `dumpsys package` for
+`userId=` either — the pipe kills the dump mid-write and prints `Failed to write
+while dumping service package: Broken pipe`. `pm list packages -U` is not an
+option: `Error: Unknown option: -U` on API 24.
 
 `chown` and `restorecon` are both required. A file left owned by `root` or
 labelled `u:object_r:sdcard_file:s0` is unreadable by the app, and FLauncher
@@ -293,7 +307,7 @@ fails silently back to the gradient rather than erroring — which looks
 identical to "the copy didn't happen". Verify:
 
 ```bash
-adb shell su -c 'ls -lZ /data/data/me.efesser.flauncher/app_flutter/wallpaper'
+adb shell "su -c 'ls -lZ /data/data/me.efesser.flauncher/app_flutter/wallpaper'"
 # expect: owner u0_aNN, context u:object_r:app_data_file:s0
 ```
 
@@ -327,7 +341,7 @@ deleted afterwards.
 - To revert to the stock gradient: delete the file and force-stop.
 
   ```bash
-  adb shell su -c 'rm /data/data/me.efesser.flauncher/app_flutter/wallpaper'
+  adb shell "su -c 'rm /data/data/me.efesser.flauncher/app_flutter/wallpaper'"
   adb shell am force-stop me.efesser.flauncher
   ```
 
@@ -469,7 +483,7 @@ A 27 Mbps 1080p asset was measured on a sibling box; 5.1 Mbps 1080p on this one.
 |---|---|
 | Google stack | `adb shell pm enable <package>` |
 | Launcher | `adb install -r premiumnptvlauncher2-BACKUP.apk` then `set-home-activity` |
-| Wallpaper | `adb shell su -c 'rm /data/data/me.efesser.flauncher/app_flutter/wallpaper'` then force-stop |
+| Wallpaper | `adb shell "su -c 'rm /data/data/me.efesser.flauncher/app_flutter/wallpaper'"` then force-stop |
 | AnyDesk / plugin | `adb shell pm uninstall com.anydesk.anydeskandroid` (and `...adcontrol.aosp`) |
 | WiFi setup cards | `SHOW_WIFI_SETUP_UI = true` in `WifiSetupOverlay.kt`, rebuild |
 | Device owner | `adb shell dpm remove-active-admin com.cyma.videoloop/.admin.CymaAdminReceiver` |
