@@ -32,6 +32,10 @@ version-matched to the AnyDesk client. Runbook step 2.3 has the grant check.
 |---|---|
 | `wallpaper.png` | FLauncher home-screen wallpaper (runbook step 4.1) |
 
-`wallpaper.png` is 1920×1080, but the reference panel is 1280×720 — FLauncher
+`wallpaper.png` is **solid black** — all 2,073,600 pixels are opaque `#000000`.
+A correct install and a failed one therefore look the same on screen; check the
+file's owner and SELinux label instead (the runbook's step 4.1 does).
+
+It is also 1920×1080 while the reference panel is 1280×720, so FLauncher
 downscales it at every draw. Re-exporting at 1280×720 is the cheaper asset; see
 the runbook's content specifications.

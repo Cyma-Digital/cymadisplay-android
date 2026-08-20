@@ -455,10 +455,10 @@ EOS
 
     adbx shell am force-stop "$PKG_FLAUNCHER" >/dev/null 2>&1 || true
     adbx shell monkey -p "$PKG_APP" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
-    warn "the wallpaper path was derived from strings in libapp.so, not from a
-        verified run — eyeball the home screen once on the first box:
-          adb -s $SERIAL shell am start -n $FLAUNCHER_ACTIVITY
-          adb -s $SERIAL shell screencap -p /sdcard/home.png && adb pull /sdcard/home.png"
+    # wallpaper.png is pure black, so a working install and a broken one look
+    # identical on screen. The uid assertion above is the real check; do not
+    # replace it with a screenshot.
+    info "wallpaper is solid black by design — verify by uid/label, not by eye"
   fi
 fi
 

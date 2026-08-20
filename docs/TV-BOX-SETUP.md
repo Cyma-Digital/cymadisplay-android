@@ -262,7 +262,7 @@ adb shell grep -c flauncher /data/system/users/0/package-restrictions.xml
 `com.droidlogic.mboxlauncher` is a stock system launcher that stays installed as
 a safety net; leave it alone.
 
-### 4.1 Set the FLauncher wallpaper ⚠️ not executed end-to-end
+### 4.1 Set the FLauncher wallpaper ✅
 
 FLauncher's default background is a built-in gradient. The fleet wallpaper is
 `provisioning/assets/wallpaper.png`.
@@ -279,10 +279,11 @@ through `PathUtils.getDataDirectory()` to `getDir("flutter", MODE_PRIVATE)`:
 No extension, no companion preference. The gradient stored under the
 `gradient_uuid` key in `FlutterSharedPreferences.xml` is only the **fallback**
 used when that file is absent, so dropping the file in is the whole
-configuration and removing it reverts to the gradient. Determined by reading
-strings out of the APK's `lib/*/libapp.so` (`WallpaperService`,
-`_wallpaperFile`, `/wallpaper`, `getApplicationDocumentsPath`), **not** by
-running it — validate on the first box.
+configuration and removing it reverts to the gradient. First derived from
+strings in the APK's `lib/*/libapp.so` (`WallpaperService`, `_wallpaperFile`,
+`/wallpaper`, `getApplicationDocumentsPath`), then ✅ confirmed on the reference
+box by copying a deliberately garish test image into that path and screenshotting
+the home screen: FLauncher rendered it. No preference had to be touched.
 
 **FLauncher must have been launched at least once** before this path exists:
 `app_flutter/` is created by the Flutter engine at startup, not by the
@@ -353,6 +354,10 @@ deleted afterwards.
 
 #### Notes
 
+- **`wallpaper.png` is pure black** — every one of its 2,073,600 pixels is
+  `#000000`, opaque. So a correct install and a *failed* install look identical
+  on screen. Do not verify this step by eye; verify it by the file's owner and
+  SELinux label, or by temporarily copying in a coloured image.
 - **The asset is 1920×1080 and the panel is 1280×720.** FLauncher downscales it
   on every draw of the home screen. That is not on the playback hot path, so it
   costs nothing while the signage is in front — but re-export at 1280×720 (see
