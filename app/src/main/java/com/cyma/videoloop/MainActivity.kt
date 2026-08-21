@@ -239,11 +239,10 @@ private fun SplashScreen() {
  */
 @Composable
 private fun RotatedScreen(degrees: Float, content: @Composable () -> Unit) {
-    // No `degrees == 0f` fast path on purpose. The graphicsLayer below wraps the
-    // whole tree in a single RenderNode; without it, hardware-layer children
-    // (the video TextureView, the template WebView) are composited by the render
-    // thread *above* siblings drawn after them on this signage GPU, which hid the
-    // NetworkStatusIndicator in HORIZONTAL while every rotated orientation was fine.
+    if (degrees == 0f) {
+        content()
+        return
+    }
     val swap = degrees == 90f || degrees == 270f
     Layout(
         modifier = Modifier

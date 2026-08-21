@@ -48,12 +48,7 @@ fun NetworkStatusIndicator(
         val minSide = minOf(maxWidth, maxHeight)
         // 0.55vmin → a 4px dot on a 720p @160dpi signage panel (dp == px there).
         val diameter = (minSide * 0.0055f).coerceIn(4.dp, 14.dp)
-        // 3%, not 1.5%: TVs overscan, cropping a few percent off each edge. At 1.5%
-        // the dot sat 11px from the corner on a 720p signage box — inside the crop
-        // band, i.e. invisible on a TV while fine on a monitor. The 48dp cap matters
-        // at low density (dp==px at 160dpi, so a small cap would land under the
-        // crop). Monitors/tablets only see the dot move a few dp inward.
-        val margin = (minSide * 0.03f).coerceIn(8.dp, 48.dp)
+        val margin = (minSide * 0.015f).coerceIn(6.dp, 28.dp)
         androidx.compose.foundation.layout.Box(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
