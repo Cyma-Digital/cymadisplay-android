@@ -558,6 +558,12 @@ adb shell cat /sys/devices/system/cpu/online        # expect 0-3
 PID=$(adb shell pidof com.cyma.videoloop | tr -d '\r')
 adb shell "for t in /proc/$PID/task/*; do cat \$t/comm; done" | grep -c AudioTrack
 
+# record the WebView engine -- this box's CSS floor, and the OS version string lies
+# (one box reports release 16.0 on API 24). Chromium < 57 needs the template shims.
+adb shell dumpsys package com.android.webview | grep versionName
+adb shell dumpsys package com.google.android.webview | grep versionName   # alternate provider
+adb logcat -d -s TplWebView | grep "WebView engine"                       # once a template plays
+
 # home screen
 adb shell cmd package resolve-activity -c android.intent.category.HOME \
     -a android.intent.action.MAIN | grep packageName

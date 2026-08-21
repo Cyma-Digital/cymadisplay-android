@@ -1,5 +1,6 @@
 package com.cyma.videoloop.data.template
 
+import android.util.Log
 import com.cyma.videoloop.data.api.CampoDto
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.contentOrNull
@@ -22,11 +23,17 @@ class TemplateRenderer @Inject constructor() {
      *
      * Strips `onerror=` / `onload=` event handlers afterward so the WebView
      * never reaches for the S3 fallback baked into every template tag.
+     *
+     * [styleSheets] is the text of the template's external stylesheets, already on disk
+     * by the time this runs. It feeds [LegacyDecorationShim], which needs the CSS to know
+     * what to shim; pass nothing and the shim simply has less to look at (the document's
+     * own `<style>` blocks are still scanned).
      */
     fun render(
         rawTemplate: String,
         conteudo: Map<String, List<Map<String, JsonElement>>>,
         campos: List<CampoDto>,
+        styleSheets: List<String> = emptyList(),
     ): String {
         var out = rawTemplate
         for (field in campos) {
@@ -45,7 +52,16 @@ class TemplateRenderer @Inject constructor() {
                 }
             }
         }
-        return injectViewportFitOverride(rewriteAssetUrls(sanitizeLinks(stripEventHandlers(out))))
+        val html = rewriteAssetUrls(sanitizeLinks(stripEventHandlers(out)))
+        // A compat-scan failure must degrade to no shim, never to no template: render()
+        // throwing surfaces as MaterializeResult.Error, i.e. a black slot in the loop.
+        val shim = runCatching { LegacyDecorationShim.apply(html, styleSheets) }
+            .onFailure { Log.w(TAG, "legacy decoration shim skipped: ${it.message}") }
+            .getOrNull()
+        return injectStyles(
+            shim?.html ?: html,
+            listOf(VIEWPORT_FIT_CSS, shim?.css.orEmpty()),
+        )
     }
 
     private fun JsonElement.maybeContent(): String? = runCatching {
@@ -53,6 +69,8 @@ class TemplateRenderer @Inject constructor() {
     }.getOrNull()
 
     companion object {
+        private const val TAG = "TemplateRenderer"
+
         // Matches `onerror="..."`, `onload='...'`, with optional whitespace.
         private val EVENT_HANDLER_REGEX = Regex(
             """\s+on(?:error|load)\s*=\s*(?:"[^"]*"|'[^']*')""",
@@ -129,22 +147,49 @@ class TemplateRenderer @Inject constructor() {
         // hidden and the template shows no content. Load-time paint jank is
         // handled by the reveal cover in PlaybackEngine, not by killing
         // animations — the animations are part of the authored design.
-        private const val VIEWPORT_FIT_OVERRIDE = """<style>
-.body, .content {
+        private const val VIEWPORT_FIT_CSS = """.body, .content {
   aspect-ratio: auto !important;
   width: 100vw !important;
   height: 100vh !important;
   max-width: 100vw !important;
   max-height: 100vh !important;
 }
-</style>
-</head>"""
+"""
 
-        fun injectViewportFitOverride(html: String): String =
-            if (HEAD_CLOSE_REGEX.containsMatchIn(html)) {
-                HEAD_CLOSE_REGEX.replaceFirst(html, VIEWPORT_FIT_OVERRIDE)
-            } else {
-                html
+        private val BODY_OPEN_REGEX = Regex("""<body\b[^>]*>""", RegexOption.IGNORE_CASE)
+        private val HTML_OPEN_REGEX = Regex("""<html\b[^>]*>""", RegexOption.IGNORE_CASE)
+
+        /**
+         * Appends each block as its own `<style>` element at the end of `<head>` — the
+         * position is load-bearing: being last, after the template's own
+         * `<link rel="stylesheet">`, is what makes our `!important` declarations win ties
+         * against the template's own `!important` rules.
+         *
+         * Separate `<style>` elements so a shim bug can never break the viewport fix.
+         *
+         * Falls back to just after `<body>`, then just after `<html>`, for the templates
+         * that ship no `</head>` (they used to get no injection at all). Never splices at
+         * index 0: content before the doctype puts Chromium in quirks mode, which changes
+         * vh/box-model behaviour and visibly reflows every template.
+         *
+         * Splices by index rather than `Regex.replaceFirst(String)`, whose replacement
+         * argument treats `$` and `\` as group references — generated CSS can carry a `$`
+         * (e.g. an attribute-suffix selector), which would corrupt the document or throw.
+         */
+        fun injectStyles(html: String, cssBlocks: List<String>): String {
+            val blocks = cssBlocks.filter { it.isNotBlank() }
+            if (blocks.isEmpty()) return html
+            val styles = blocks.joinToString("\n") { "<style>\n$it</style>" }
+            HEAD_CLOSE_REGEX.find(html)?.let { m ->
+                return html.substring(0, m.range.first) + styles + "\n" + html.substring(m.range.first)
             }
+            BODY_OPEN_REGEX.find(html)?.let { m ->
+                return html.substring(0, m.range.last + 1) + "\n" + styles + html.substring(m.range.last + 1)
+            }
+            HTML_OPEN_REGEX.find(html)?.let { m ->
+                return html.substring(0, m.range.last + 1) + "\n" + styles + html.substring(m.range.last + 1)
+            }
+            return html
+        }
     }
 }

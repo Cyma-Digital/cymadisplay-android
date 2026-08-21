@@ -16,7 +16,10 @@ Android kiosk/signage app (`com.cyma.videoloop`) that downloads a scheduled play
 ./gradlew clean
 ```
 
-No test suite exists yet — `./gradlew test` is a no-op.
+`./gradlew test` runs JVM unit tests. They are scoped to the pure string surgery in
+`data/template/` (CSS scanner + legacy-WebView decoration shim) — the code that rewrites
+every template on every box, whose branches don't show up in an on-device screenshot.
+Nothing else has tests; there is no instrumented (`androidTest`) source set.
 
 **Toolchain**: Gradle 8.5 · AGP 8.2.0 · Kotlin 1.9.20 · KSP 1.9.20-1.0.14 · Compose Compiler 1.5.4 · JDK 17 · `compileSdk` 34 · `minSdk` 21.
 
@@ -66,18 +69,26 @@ com.cyma.videoloop/
 │   │   └── GeoLocationRepository.kt  boot-only WiFi trilateration; fix cached in DataStore
 │   ├── schedule/
 │   │   ├── ScheduleStore.kt      DataStore wrapper; holds current Schedule JSON; ships default hardcoded schedule
-│   │   └── ScheduleRepository.kt  exposes schedule() Flow; syncFromNetwork() stub for Phase 3
-│   └── media/
-│       ├── MediaDownloader.kt    OkHttp streaming download; atomic .part→final rename; ETag-aware
-│       ├── MediaCatalog.kt       url → localFile mapping (sha256(url).<ext> under filesDir/media/)
-│       └── MediaCacheRepository.kt  materialize(item): Flow<MaterializeResult>; prefetchAll; evictOrphans
+│   │   └── ScheduleRepository.kt  exposes schedule() Flow; syncFromNetwork(); mints the
+│   │                              template id = "template-" + sha256(rawTemplate + conteudoJson)
+│   ├── media/
+│   │   ├── MediaDownloader.kt    OkHttp streaming download; atomic .part→final rename; ETag-aware
+│   │   ├── MediaCatalog.kt       url → localFile mapping (sha256(url).<ext> under filesDir/media/)
+│   │   └── MediaCacheRepository.kt  materialize(item): Flow<MaterializeResult>; prefetchAll; evictOrphans
+│   └── template/
+│       ├── TemplateRenderer.kt   placeholder substitution + sanitization + injected compat <style>
+│       ├── TemplateCatalog.kt    disk layout filesDir/templates/<id>/index.html + assets/template-N/
+│       ├── TemplateAssetExtractor.kt  pulls assets/template-N/... refs out of raw HTML → S3 URLs
+│       ├── CssRuleScanner.kt     brace-depth CSS scanner (pure); rules, selectors, declarations
+│       └── LegacyDecorationShim.kt  Chromium-52 coloured-decoration shim (pure); see § Templates
 ├── domain/model/
-│   ├── PlaylistItem.kt           sealed interface Video | Image; @Serializable with @SerialName
+│   ├── PlaylistItem.kt           sealed interface Video | Image | Template; @Serializable with @SerialName
 │   ├── Schedule.kt               Schedule + ActiveWindow; @Serializable
 │   └── DeviceState.kt            Unpaired | Paired
 ├── util/
 │   ├── HashUtils.kt              sha256()
-│   └── QrCode.kt                 ZXing QR bitmap + WIFI: payload builder
+│   ├── QrCode.kt                 ZXing QR bitmap + WIFI: payload builder
+│   └── WebViewEngine.kt          reads/logs the box's Chromium version (diagnosis only)
 ├── ui/
 │   ├── provisioning/
 │   │   ├── WifiSetupOverlay.kt   corner overlay container; dispatches WifiProvisioningCoordinator.state
@@ -87,7 +98,8 @@ com.cyma.videoloop/
 │   ├── playback/
 │   │   ├── PlaybackViewModel.kt  @HiltViewModel; collects schedule → materializes each item → emits PlaybackUiState
 │   │   ├── PlaybackScreen.kt     observes ViewModel; shows DownloadDialog or PlaybackEngine or ErrorScreen
-│   │   └── PlaybackEngine.kt     queue walker: VideoSlot (ExoPlayer) | ImageSlot (Coil + LaunchedEffect timer)
+│   │   └── PlaybackEngine.kt     queue walker: VideoSlot (ExoPlayer) | ImageSlot (Coil + timer)
+│   │                             | TemplateSlot (WebView + reveal cover)
 │   └── pairing/
 │       ├── PairingViewModel.kt   loads deviceId + pairingCode; stub UI for Phase 2
 │       └── PairingScreen.kt      displays device ID + 6-char pairing code
@@ -225,6 +237,131 @@ Key invariants:
   hotspot is already down, so it can never fight `WifiProvisioningCoordinator` for a
   single-radio box's antenna. Don't move the scan earlier.
 - **The 5-min tick never spends a Google call** — it reads the cached fix only.
+
+## Templates (WebView rendering)
+
+A schedule item can be an HTML template: raw HTML authored server-side for modern
+browsers, plus a `conteudo`/`campos` payload. The app renders it locally and plays it in a
+WebView like any other playlist item.
+
+1. `ScheduleRepository.toTemplateItem` mints `id = "template-" + sha256(rawTemplate + conteudoJson)`.
+2. `TemplateAssetExtractor` pulls `assets/template-N/...` refs out of the raw HTML and maps
+   them to the S3 bucket `cymadisplay.assets`.
+3. `MediaCacheRepository.materializeTemplate` downloads those assets, reads each downloaded
+   `.css` to discover second-level assets (fonts), renders, and writes `index.html`
+   atomically (`.part` → rename) under `filesDir/templates/<id>/`.
+4. `TemplateRenderer.render` substitutes `<!-- name -->` placeholders, strips `on*` handlers,
+   sanitizes `<link>`s, rewrites S3 URLs, and injects compat `<style>` blocks.
+5. `PlaybackEngine.buildTemplateView` serves the directory over `https://appassets.cyma.local`
+   via `WebViewAssetLoader`, with **JavaScript disabled** and `setNetworkAvailable(false)`,
+   and reveals the WebView only after `postVisualStateCallback` + a settle delay.
+
+### Legacy WebView CSS support floor
+
+**The floor is Chromium 52** — `com.android.webview` 52.0.2743.100, `/system/app/webview`,
+on the API 24 box `1546794507d45000007a`, which reports `ro.build.version.release=16.0`.
+**The Android version string on these boxes is worthless.** Read the WebView package
+version instead; `WebViewEngine.logOnce` logs it under the `TplWebView` tag at the first
+template, next to the engine's own console complaints:
+
+```
+adb shell dumpsys package com.android.webview | grep versionName   # also com.google.android.webview
+adb logcat -s TplWebView                                           # "WebView engine: chromium=52 ..."
+```
+
+Anything newer than Chrome 52 must be shimmed or avoided — `filter` (53), `clip-path` (55),
+`position: sticky` (56), CSS Grid (57), `text-decoration-color`/`-line`/`-thickness` (57),
+flexbox `gap` (84), `aspect-ratio` (88 — already shimmed by the injected viewport override).
+
+- **Unsupported declarations are dropped silently at parse time** and fall back to the
+  initial/inherited value. There is no error for it. That is how template 7's `#a5151c`
+  heading underline became white: `text-decoration-color` vanished, so the line painted in
+  `currentColor`, which the same rule set to `#fff`.
+- **`-webkit-` prefixes do not help.** Verified on hardware: `-webkit-text-decoration-color`
+  is just as dead in this build. Never "fix" a gap by adding a prefix without checking on a box.
+- **On this engine a native text decoration can never be a different colour from its text.**
+  Measured with a sentinel-colour probe page in `org.chromium.webview_shell` (same engine):
+  the decoration paints in the *descendant's* glyph colour and follows
+  `-webkit-text-fill-color` too, so no `color`/`text-fill-color` trick recovers it. The only
+  mechanism is to suppress the decoration and paint the line yourself.
+- **A shim must be version-invariant** — the same paint on 52 and on a modern engine — or it
+  must be gated. Nothing is gated today, deliberately: a box's WebView can be updated
+  underneath a cached `index.html`, and the render is not per-device. For the decoration
+  stripe, `text-decoration: none !important` is what makes it invariant; omit it and modern
+  engines draw two lines. Confirmed by rendering the same `index.html` in desktop Chrome.
+- **Never rewrite the downloaded `.css` on disk, and never rewrite bytes in
+  `shouldInterceptRequest`.** The on-disk `index.html` staying exactly what the WebView sees
+  is the only cheap way to debug the next quirk (`adb pull` it and open it in Chrome).
+
+### How the coloured-decoration shim works
+
+`LegacyDecorationShim` (pure, unit-tested) scans the template's stylesheets plus its inline
+`<style>` blocks with `CssRuleScanner`, and for each rule that really does decorate text in
+a literal colour it emits, into the injected `<style>`:
+
+```css
+div.body h1 { text-decoration: none !important; }              /* suppress the native line */
+div.body h1 > span.cyma-legacy-deco {                          /* paint it ourselves      */
+  background-image: linear-gradient(#a5151c, #a5151c) !important;
+  background-repeat: repeat-x !important;
+  background-size: 4px 0.09em !important;
+  background-position: 0 90% !important;
+}
+```
+
+A stripe on an **inline** box is drawn per line fragment and hugs the text, which is exactly
+what a native underline does — measured against the native line on hardware: 3 px thick,
+within 1 px of the same position, on both fragments of a wrapped two-line heading. A
+`border-bottom` on the block marks only the bottom of the whole block and sits 6 px lower,
+so it is not used. Block subjects have no inline box of their own, so the shim wraps their
+content in `<span class="cyma-legacy-deco">` (`LegacyDecorationShim.wrapContent`) and styles
+the wrapper; inline subjects (`u`, `strike`, …) get the stripe directly.
+
+Adding the next gap: a new emitter in `LegacyDecorationShim` plus JVM test cases. Keep it
+version-invariant, keep it guarded, keep it pure.
+
+Key invariants:
+
+- **A rule that declares a decoration colour but no decoration line must be left alone.**
+  Template 7's `div.body h2` does exactly that (`text-decoration-color` with no line, red
+  rule drawn by `border-bottom`, text `#ffc627`). Its colour declaration is inert even on a
+  modern engine; shimming it would recolour the subtitle. `u`/`strike` are the opposite case
+  — no line in the CSS, but the UA stylesheet gives them one — so the gate is "a line is
+  declared **or** the subject is a UA-decorated element".
+- **The shim guards then skips.** Non-literal colour (`var()`, `currentColor`), a rule that
+  paints its own `background`, `*`/`html`/`body` subjects, pseudo-elements and states, more
+  than 32 candidates, a sheet over the rule cap — each yields no shim, i.e. today's
+  rendering. A wrongly-coloured line beats a wrecked template.
+- **Killing the native decoration and painting the stripe are one decision.** If nothing
+  could be wrapped (same-tag nesting like `<li>` in `<li>`, or markup-only content), the
+  shim emits nothing rather than a `text-decoration: none` with no stripe behind it.
+- **A shim failure degrades to no shim, never to no template.** `render()` throwing surfaces
+  as `MaterializeResult.Error`, i.e. a black slot in the loop, so the scan is wrapped in
+  `runCatching`.
+- **The injected `<style>` blocks must stay last in `<head>`**, after the template's own
+  `<link rel="stylesheet">` — that is what makes our `!important` declarations win ties
+  against the template's own `!important` rules. `TemplateRenderer.injectStyles` splices by
+  index (a `Regex.replaceFirst(String)` replacement would read a `$` in generated CSS as a
+  group reference) and falls back to after `<body>`, then after `<html>`, but never to
+  index 0 — content before the doctype puts Chromium in quirks mode and reflows everything.
+- **Do NOT disable CSS animations.** Some templates drive visibility through their entrance
+  animation (a typing/reveal effect whose pre-animation state is hidden), so `animation: none`
+  freezes them hidden and the template shows nothing. Load-time paint jank is handled by the
+  reveal cover in `PlaybackEngine`.
+- **The cache does not self-invalidate.** The id is `sha256(rawTemplate + conteudoJson)`, so a
+  renderer change reaches a box only when the customer's content changes — or when the cache
+  is wiped by hand. After shipping any renderer change:
+
+  ```bash
+  adb shell su -c 'rm -rf /data/data/com.cyma.videoloop/files/templates'
+  adb shell am force-stop com.cyma.videoloop && adb shell am start -n com.cyma.videoloop/.MainActivity
+  ```
+
+  Assets re-download after a wipe, so do it on a box that has network.
+- **The visible text colour often comes from the content, not the stylesheet.** The
+  customer-facing editor emits `<font color="#ffffff">` and `style="color: rgb(255,255,255)"`
+  inside the headings, and an author `!important` rule outranks a `style=` attribute. When a
+  colour looks wrong, read the rendered `index.html`, not just the CSS.
 
 ## WiFi provisioning
 

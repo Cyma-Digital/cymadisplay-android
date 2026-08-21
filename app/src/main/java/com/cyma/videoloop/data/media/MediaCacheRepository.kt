@@ -109,13 +109,18 @@ class MediaCacheRepository @Inject constructor(
         }
 
         val discoveredAssets = mutableMapOf<String, String>()
+        // The renderer needs this same CSS text to generate the legacy-WebView decoration
+        // shim, so keep what we read here instead of reading each file twice.
+        val styleSheets = mutableListOf<String>()
         for (url in item.assetUrls) {
             val relPath = url.substringAfter("cymadisplay.assets/").substringBefore('?')
             if (!relPath.endsWith(".css", ignoreCase = true)) continue
             val cssFile = templateCatalog.assetFile(item.id, relPath)
             if (!cssFile.exists()) continue
             val cssDir = relPath.substringBeforeLast('/', "")
-            CSS_URL_REGEX.findAll(cssFile.readText(Charsets.UTF_8)).forEach { match ->
+            val cssText = cssFile.readText(Charsets.UTF_8)
+            styleSheets += cssText
+            CSS_URL_REGEX.findAll(cssText).forEach { match ->
                 val ref = match.groupValues[1]
                 if (ref.startsWith("data:", ignoreCase = true) || ref.startsWith("#")) return@forEach
                 when {
@@ -147,7 +152,7 @@ class MediaCacheRepository @Inject constructor(
         val rendered = try {
             val conteudo = json.decodeFromString<Map<String, List<Map<String, JsonElement>>>>(item.conteudoJson)
             val campos = json.decodeFromString<List<CampoDto>>(item.camposJson)
-            templateRenderer.render(item.rawTemplate, conteudo, campos)
+            templateRenderer.render(item.rawTemplate, conteudo, campos, styleSheets)
         } catch (e: Exception) {
             send(MaterializeResult.Error("render failed: ${e.message}"))
             return

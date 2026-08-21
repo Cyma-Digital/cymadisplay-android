@@ -24,7 +24,8 @@ Single-module app under `app/`. Source code lives at `app/src/main/java/com/cyma
 └── util/                  HashUtils
 ```
 
-Resources are at `app/src/main/res/`. No test directory exists yet.
+Resources are at `app/src/main/res/`. JVM unit tests live in `app/src/test/`, scoped to
+the pure CSS/HTML string surgery in `data/template/`; there is no `androidTest`.
 
 ## Build, Test, and Development Commands
 
@@ -36,7 +37,11 @@ Resources are at `app/src/main/res/`. No test directory exists yet.
 ./gradlew clean             # Clean build outputs
 ```
 
-No test suite exists — `./gradlew test` is a no-op.
+`./gradlew test` runs the JVM unit tests for `data/template/` (CSS scanner + legacy-WebView
+decoration shim). Nothing else is covered.
+
+Template HTML/CSS must render on **Chromium 52** — the fleet's WebView floor. See
+CLAUDE.md § "Legacy WebView CSS support floor" before reaching for any modern CSS.
 
 ## JDK Requirement (Critical)
 

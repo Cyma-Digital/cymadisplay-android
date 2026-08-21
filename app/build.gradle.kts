@@ -153,5 +153,11 @@ dependencies {
 
     debugImplementation(libs.compose.ui.tooling)
     debugImplementation(libs.compose.ui.test.manifest)
+
+    // JVM unit tests. Scoped to the pure string surgery in data/template — the CSS
+    // scanner and the legacy-WebView decoration shim rewrite every template on every
+    // box, and their branches (comment stripping, @media nesting, selector splitting)
+    // are invisible in an on-device screenshot.
+    testImplementation(libs.junit)
 }
 

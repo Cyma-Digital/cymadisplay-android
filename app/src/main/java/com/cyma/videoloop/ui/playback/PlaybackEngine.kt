@@ -52,6 +52,7 @@ import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewAssetLoader.InternalStoragePathHandler
 import coil.compose.AsyncImage
 import com.cyma.videoloop.BuildConfig
+import com.cyma.videoloop.util.WebViewEngine
 import kotlinx.coroutines.delay
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -317,6 +318,10 @@ private fun buildTemplateView(
     item: ResolvedItem.Template,
     onReady: () -> Unit,
 ): FrameLayout {
+    // The box's Android version is unreliable (one reports 16.0 on API 24); the CSS the
+    // template can rely on is set by the WebView package version. Logged once per process.
+    WebViewEngine.logOnce(context)
+
     val templateRoot = item.indexFile.parentFile!!
     val assetLoader = WebViewAssetLoader.Builder()
         .setDomain(TEMPLATE_ASSET_DOMAIN)
